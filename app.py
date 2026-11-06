@@ -242,7 +242,7 @@ def game_insights(df, asof):
         ks.append(f"Secara bersih masih **boros {rp(net)}**: penghematan ({rp(s['hemat'])}) belum menutup overpay.")
     else:
         ks.append(f"Secara bersih sudah **hemat {rp(-net)}**: penghematan ({rp(s['hemat'])}) melebihi overpay.")
-    hit_txt = f"{s['hit']:.0%} transaksi berada di/di bawah acuan"
+    hit_txt = f"{s['hit']:.0%} transaksi berada dibawah acuan"
     if s["n12"]:
         hit_txt += f"; dalam 12 bulan terakhir {s['hit12']:.0%} ({s['n12']} transaksi)"
     ks.append(hit_txt + ".")
