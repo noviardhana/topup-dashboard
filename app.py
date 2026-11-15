@@ -303,9 +303,9 @@ def joki_insights(df, asof):
     byj = df.groupby("Joki")["Amount"].agg(["sum", "size"]).sort_values("sum", ascending=False)
     byc = df.groupby("Content")["Amount"].agg(["sum", "size"]).sort_values("sum", ascending=False)
     singles = int((byj["size"] == 1).sum())
-    ks.append(f"Total jasa joki **{rp(total)}** dari {n} transaksi ke {len(byj)} joki; rata-rata {rp(total / n)} per transaksi.")
-    ks.append(f"Joki terbesar: **{byj.index[0]}** ({byj['sum'].iloc[0] / total:.0%} dari total); "
-              f"{singles} dari {len(byj)} joki hanya dipakai 1x.")
+    ks.append(f"Total jasa joki **{rp(total)}** dari {n} transaksi ke {len(byj)} penjoki; rata-rata {rp(total / n)} per transaksi.")
+    ks.append(f"PenJoki terbesar: **{byj.index[0]}** ({byj['sum'].iloc[0] / total:.0%} dari total); "
+              f"{singles} dari {len(byj)} jasa joki hanya dipakai 1x.")
     if len(byc) >= 2:
         ks.append(f"Konten terbesar: **{byc.index[0]}** ({byc['sum'].iloc[0] / total:.0%}) dan "
                   f"**{byc.index[1]}** ({byc['sum'].iloc[1] / total:.0%}).")
