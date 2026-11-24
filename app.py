@@ -1,4 +1,28 @@
+"""Game Spending Dashboard
+
+A Streamlit dashboard for analysing spending across Genshin, Honkai: Star Rail,
+ and game-boosting services. Transaction data is read from the ``Hoyoverse``
+Google Sheets worksheet, cleaned into consistent data frames, and presented
+through summary metrics, spending trends, shop and provider comparisons, and
+practical cost-saving insights.
+
+Configuration
+-------------
+The application expects ``sheet_id`` and ``gcp_service_account`` to be defined
+in Streamlit secrets. The source worksheet must retain its existing column
+headers, including ``70% Value``, ``Toko``, and ``Keterangan`` where applicable.
+
+Run with::
+
+    streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import html
+import numbers
 import re
+from typing import Any
 
 import gspread
 import pandas as pd
@@ -6,588 +30,1614 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Dashboard Pengeluaran Game", page_icon="💸", layout="wide")
 
-# ----------------------------------------------------------------- konfigurasi
-TAB = "Hoyoverse"
-GAME_ORDER = ["Genshin", "HSR"]  # urutan tabel game di tab, dari atas ke bawah
-RECURRING = ["VIP IT", "VIP Spiral", "Stygian Onslaught"]  # layanan joki berulang
-PALETTE = ["#6c5ce7", "#00b894", "#fdcb6e", "#e17055", "#0984e3",
-           "#e84393", "#00cec9", "#636e72", "#a29bfe", "#55efc4"]
-CAT_COLORS = {"Genshin": "#6c5ce7", "HSR": "#0984e3", "Joki": "#e17055"}
-GOOD, BAD, ACCENT = "#00b894", "#e17055", "#6c5ce7"
-PERIODS = {"Bulanan": "Bulan", "Kuartalan": "Kuartal", "Per patch": "Patch", "Tahunan": "Tahun"}
-PERIODS_NOPATCH = {k: v for k, v in PERIODS.items() if v != "Patch"}
+# ---------------------------------------------------------------------------
+# Application configuration
+# ---------------------------------------------------------------------------
 
-CSS = """
+WORKSHEET_NAME = "Hoyoverse"
+GAME_ORDER = ("Genshin", "HSR")
+BOOSTING_CATEGORY = "Boosting"
+RECURRING_SERVICES = ("VIP IT", "VIP Spiral", "Stygian Onslaught")
+
+COLOUR_PALETTE = (
+    "#7C83FD",
+    "#42A5A5",
+    "#E6B566",
+    "#E07A5F",
+    "#5B9BD5",
+    "#C084B8",
+    "#6FC2B0",
+    "#8795A1",
+    "#A79BDB",
+    "#8FC7A2",
+)
+CATEGORY_COLOURS = {
+    "Genshin": "#7C83FD",
+    "HSR": "#5B9BD5",
+    BOOSTING_CATEGORY: "#E07A5F",
+}
+SAVINGS_COLOUR = "#3FA67A"
+OVERPAY_COLOUR = "#D97770"
+ACCENT_COLOUR = "#7C83FD"
+
+PERIOD_OPTIONS = {
+    "Monthly": "Month",
+    "Quarterly": "Quarter",
+    "By patch": "Patch",
+    "Yearly": "Year",
+}
+SUMMARY_PERIOD_OPTIONS = {
+    label: value for label, value in PERIOD_OPTIONS.items() if value != "Patch"
+}
+
+# These names belong to the existing Google Sheets schema and must not be
+# translated unless the worksheet headers are changed as well.
+SOURCE_REFERENCE_COLUMN = "70% Value"
+SOURCE_SHOP_COLUMN = "Toko"
+SOURCE_DESCRIPTION_COLUMN = "Keterangan"
+SOURCE_PROVIDER_COLUMN = "Joki"
+
+DASHBOARD_CSS = """
 <style>
-.hero{background:linear-gradient(120deg,#6c5ce7 0%,#0984e3 100%);color:#fff;border-radius:18px;padding:22px 26px;margin-bottom:18px}
-.hero .t{font-size:1.7rem;font-weight:800}
-.hero .s{opacity:.92;font-size:.9rem;margin-top:4px}
-.kpi{border:1px solid rgba(128,128,128,.25);border-radius:14px;padding:14px 16px;background:rgba(128,128,128,.07);margin-bottom:10px}
-.kpi .l{font-size:.72rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em}
-.kpi .v{font-size:1.45rem;font-weight:700;line-height:1.35}
-.kpi .s{font-size:.78rem;opacity:.75;min-height:1.1em}
-.kpi.good .v{color:#00b894}
-.kpi.bad .v{color:#e17055}
+    .dashboard-header {
+        padding: 1.1rem 1.35rem;
+        margin: 0 0 1.25rem 0;
+        border: 1px solid rgba(140, 150, 165, 0.24);
+        border-radius: 12px;
+        background: var(--secondary-background-color);
+    }
+    .dashboard-eyebrow {
+        margin-bottom: 0.25rem;
+        color: var(--primary-color);
+        font-size: 0.70rem;
+        font-weight: 700;
+        letter-spacing: 0.11em;
+        text-transform: uppercase;
+    }
+    .dashboard-title {
+        color: var(--text-color);
+        font-size: 1.65rem;
+        font-weight: 700;
+        line-height: 1.25;
+    }
+    .dashboard-subtitle {
+        margin-top: 0.35rem;
+        color: var(--text-color);
+        font-size: 0.86rem;
+        opacity: 0.70;
+    }
+    .kpi-card {
+        min-height: 105px;
+        padding: 0.85rem 1rem;
+        margin-bottom: 0.6rem;
+        border: 1px solid rgba(140, 150, 165, 0.24);
+        border-radius: 10px;
+        background: var(--secondary-background-color);
+    }
+    .kpi-label {
+        margin-bottom: 0.35rem;
+        color: var(--text-color);
+        font-size: 0.70rem;
+        font-weight: 600;
+        letter-spacing: 0.045em;
+        opacity: 0.72;
+        text-transform: uppercase;
+    }
+    .kpi-value {
+        color: var(--text-color);
+        font-size: 1.35rem;
+        font-weight: 700;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+    }
+    .kpi-card.good .kpi-value { color: #55B889; }
+    .kpi-card.bad .kpi-value { color: #E1847C; }
+    .kpi-caption {
+        min-height: 1.05rem;
+        margin-top: 0.2rem;
+        color: var(--text-color);
+        font-size: 0.73rem;
+        opacity: 0.68;
+    }
+    div[data-testid="stPlotlyChart"] {
+        border: 1px solid rgba(140, 150, 165, 0.15);
+        border-radius: 10px;
+        padding: 0.15rem;
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid rgba(140, 150, 165, 0.18);
+        border-radius: 8px;
+    }
 </style>
 """
 
 
-# --------------------------------------------------------------------- helper
-def rp(x):
-    return "Rp" + f"{x:,.0f}".replace(",", ".")
+# ---------------------------------------------------------------------------
+# Formatting and presentation helpers
+# ---------------------------------------------------------------------------
+def format_rupiah(value: Any) -> str:
+    """Format a numeric value as whole Indonesian rupiah.
+
+    Args:
+        value: The numeric value to format.
+
+    Returns:
+        A currency string using dots as thousands separators, or an em dash
+        when the value is missing.
+    """
+    if pd.isna(value):
+        return "—"
+    return "Rp " + f"{float(value):,.0f}".replace(",", ".")
 
 
-def to_num(s):
-    return pd.to_numeric(s.astype(str).str.replace(r"[Rp,\s]", "", regex=True), errors="coerce")
+def _parse_numeric_value(value: Any) -> float:
+    """Parse one numeric value, including Indonesian and international formats.
 
+    Args:
+        value: A number or formatted numeric string, optionally with a currency
+            symbol, thousands separators, decimal separators, or parentheses.
 
-def to_date(s):
-    d = pd.to_datetime(s, format="%B %d, %Y", errors="coerce")
-    return d.fillna(pd.to_datetime(s, errors="coerce"))
+    Returns:
+        The parsed number, or NaN when the value is empty or invalid.
+    """
+    if pd.isna(value):
+        return float("nan")
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        return float(value)
 
+    text = str(value).strip().replace("−", "-")
+    if not text:
+        return float("nan")
 
-def ver_key(v):
+    is_parenthesised_negative = text.startswith("(") and text.endswith(")")
+    text = re.sub(r"[^0-9,.+\-]", "", text)
+    if not text or text in {"+", "-", ".", ","}:
+        return float("nan")
+
+    explicit_negative = text.startswith("-") or is_parenthesised_negative
+    text = text.lstrip("+-")
+    if not text:
+        return float("nan")
+
+    has_dot = "." in text
+    has_comma = "," in text
+
+    if has_dot and has_comma:
+        # The right-most separator is the decimal separator; the other is
+        # treated as a thousands separator (e.g. 1.234,56 or 1,234.56).
+        decimal_separator = "." if text.rfind(".") > text.rfind(",") else ","
+        thousands_separator = "," if decimal_separator == "." else "."
+        text = text.replace(thousands_separator, "")
+        text = text.replace(decimal_separator, ".")
+    elif has_dot or has_comma:
+        separator = "." if has_dot else ","
+        groups = text.split(separator)
+        if len(groups) > 2:
+            if all(len(group) == 3 for group in groups[1:]):
+                text = "".join(groups)
+            else:
+                text = groups[0] + "." + "".join(groups[1:])
+        elif len(groups) == 2:
+            # A single three-digit suffix is a thousands group; other suffix
+            # lengths are interpreted as decimal places.
+            if len(groups[1]) == 3 and len(groups[0]) <= 3:
+                text = "".join(groups)
+            else:
+                text = groups[0] + "." + groups[1]
+
     try:
-        return tuple(int(x) for x in str(v).split("."))
+        parsed = float(text)
     except ValueError:
-        return (999,)
+        return float("nan")
+    return -abs(parsed) if explicit_negative else parsed
 
 
-def kpi(col, label, value, sub="", tone=""):
-    col.markdown(
-        f'<div class="kpi {tone}"><div class="l">{label}</div>'
-        f'<div class="v">{value}</div><div class="s">{sub}</div></div>',
+def to_number(values: pd.Series) -> pd.Series:
+    """Convert raw or formatted monetary values into numeric values.
+
+    Args:
+        values: A pandas Series containing numbers or strings such as
+            ``1.234.567``, ``1.234.567,00``, or ``1,234,567.00``.
+
+    Returns:
+        A numeric Series. Values that cannot be interpreted become NaN.
+    """
+    return pd.to_numeric(values.map(_parse_numeric_value), errors="coerce")
+
+
+def to_date(values: pd.Series) -> pd.Series:
+    """Convert Google Sheets date serials or date strings into datetimes.
+
+    Args:
+        values: A pandas Series containing Google Sheets serial dates, date
+            strings, or missing values.
+
+    Returns:
+        A datetime Series; unrecognised values are represented by NaT.
+    """
+    def parse_date_value(value: Any) -> Any:
+        if pd.isna(value):
+            return pd.NaT
+        if isinstance(value, numbers.Real) and not isinstance(value, bool):
+            return pd.to_datetime(
+                value,
+                unit="D",
+                origin="1899-12-30",
+                errors="coerce",
+            )
+
+        text = str(value).strip()
+        parsed = pd.to_datetime(text, format="%B %d, %Y", errors="coerce")
+        return parsed if not pd.isna(parsed) else pd.to_datetime(text, errors="coerce")
+
+    return pd.to_datetime(values.map(parse_date_value), errors="coerce")
+
+
+def version_sort_key(version: Any) -> tuple[int, ...]:
+    """Create a sortable numeric key from a game version label.
+
+    Args:
+        version: A version label such as ``5.3`` or ``4.7.1``.
+
+    Returns:
+        A tuple of numeric components. Labels without numbers sort last.
+    """
+    components = re.findall(r"\d+", str(version))
+    return tuple(int(part) for part in components) if components else (10**9,)
+
+
+def render_kpi(column: Any, label: str, value: str, caption: str = "", tone: str = "") -> None:
+    """Render a compact KPI card inside a Streamlit column.
+
+    Args:
+        column: The Streamlit column that will contain the card.
+        label: The metric label displayed above the value.
+        value: The primary metric value.
+        caption: Optional supporting text below the value.
+        tone: Optional status class: ``good``, ``bad``, or an empty string.
+
+    Returns:
+        None. The card is rendered directly in the Streamlit interface.
+    """
+    safe_label = html.escape(str(label))
+    safe_value = html.escape(str(value))
+    safe_caption = html.escape(str(caption))
+    safe_tone = tone if tone in {"good", "bad"} else ""
+    column.markdown(
+        f'<div class="kpi-card {safe_tone}">'
+        f'<div class="kpi-label">{safe_label}</div>'
+        f'<div class="kpi-value">{safe_value}</div>'
+        f'<div class="kpi-caption">{safe_caption}</div>'
+        "</div>",
         unsafe_allow_html=True,
     )
 
 
-def bullets(items):
-    st.markdown("\n".join(f"- {t}" for t in items) if items else "_Belum ada catatan._")
+def render_bullets(items: list[str]) -> None:
+    """Render a list of insight statements as Markdown bullets.
+
+    Args:
+        items: Insight strings to display.
+
+    Returns:
+        None. The bullet list is rendered in the Streamlit interface.
+    """
+    content = "\n".join(f"- {item}" for item in items) if items else "_No notes are available._"
+    st.markdown(content)
 
 
-def saran_text(items, limit=None):
-    out = []
-    for it in items[:limit]:
-        t = it["text"]
-        if it["est"] > 0:
-            t += f" _(estimasi hemat {rp(it['est'])})_"
-        out.append(t)
-    return out
+def format_recommendations(items: list[dict[str, Any]], limit: int | None = None) -> list[str]:
+    """Add estimated savings to recommendations and optionally limit the list.
+
+    Args:
+        items: Recommendation dictionaries containing ``text`` and ``est``.
+        limit: Maximum number of recommendations to return, or None for all.
+
+    Returns:
+        A list of formatted recommendation strings.
+    """
+    selected_items = items if limit is None else items[:limit]
+    output = []
+    for item in selected_items:
+        text = item["text"]
+        if item["est"] > 0:
+            text += f" _(estimated saving: {format_rupiah(item['est'])})_"
+        output.append(text)
+    return output
 
 
-def fmt_table(d, money=()):
-    d = d.copy()
-    if "Date" in d:
-        d["Date"] = d["Date"].dt.strftime("%d %b %Y")
-    for c in money:
-        d[c] = d[c].map(rp)
-    return d
+def format_table(frame: pd.DataFrame, money_columns: tuple[str, ...] | list[str] = ()) -> pd.DataFrame:
+    """Prepare a copy of a data frame for display in Streamlit tables.
+
+    Args:
+        frame: The source data frame.
+        money_columns: Column names that should be formatted as rupiah.
+
+    Returns:
+        A display-ready copy with formatted dates and currency values.
+    """
+    display = frame.copy()
+    if "Date" in display:
+        display["Date"] = pd.to_datetime(display["Date"], errors="coerce").dt.strftime("%d %b %Y")
+    for column in money_columns:
+        if column in display:
+            display[column] = display[column].map(format_rupiah)
+    return display
 
 
-# ------------------------------------------------------------------- bersihkan
-def clean_game(df):
-    df = df.copy()
-    df["Date"] = to_date(df["Date"])
-    df["Amount"] = to_num(df["Amount"])
-    df["Acuan"] = to_num(df["70% Value"])
-    df["Selisih"] = df["Amount"] - df["Acuan"]
-    df["Overpay"] = df["Selisih"].clip(lower=0)
-    df["Hemat"] = (-df["Selisih"]).clip(lower=0)
-    df["Version"] = df["Version"].astype(str).str.strip()
-    return df.sort_values("Date", kind="stable").reset_index(drop=True)
+# ---------------------------------------------------------------------------
+# Data cleaning and Google Sheets access
+# ---------------------------------------------------------------------------
+def clean_game_data(frame: pd.DataFrame) -> pd.DataFrame:
+    """Clean a game-spending table and calculate its reference-price variance.
+
+    Args:
+        frame: Raw game transaction data from Google Sheets.
+
+    Returns:
+        A cleaned data frame with English analytical column names and derived
+        ``Variance``, ``Overpay``, and ``Savings`` columns.
+    """
+    required = {"Date", "Amount", SOURCE_REFERENCE_COLUMN, "Version", "Item", SOURCE_SHOP_COLUMN}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Game table is missing required columns: {', '.join(sorted(missing))}.")
+
+    cleaned = frame.copy()
+    cleaned["Date"] = to_date(cleaned["Date"])
+    cleaned["Amount"] = to_number(cleaned["Amount"])
+    cleaned["Reference"] = to_number(cleaned[SOURCE_REFERENCE_COLUMN])
+    cleaned["Version"] = cleaned["Version"].astype("string").fillna("").str.strip()
+    cleaned["Item"] = cleaned["Item"].astype("string").fillna("").str.strip()
+    cleaned["Shop"] = cleaned[SOURCE_SHOP_COLUMN].astype("string").fillna("").str.strip()
+    cleaned["Variance"] = cleaned["Amount"] - cleaned["Reference"]
+    cleaned["Overpay"] = cleaned["Variance"].clip(lower=0)
+    cleaned["Savings"] = (-cleaned["Variance"]).clip(lower=0)
+    cleaned = cleaned.dropna(subset=["Date", "Amount"])
+    cleaned = cleaned.drop(columns=[SOURCE_REFERENCE_COLUMN, SOURCE_SHOP_COLUMN], errors="ignore")
+    return cleaned.sort_values("Date", kind="stable").reset_index(drop=True)
 
 
-def clean_joki(df):
-    df = df.copy()
-    df["Date"] = to_date(df["Date"])
-    df["Amount"] = to_num(df["Amount"])
-    df["Version"] = df["Version"].astype(str).str.strip()
-    if "Keterangan" not in df:
-        df["Keterangan"] = ""
-    df["Hari"] = pd.to_numeric(df["Keterangan"].str.extract(r"\((\d+)\s*hari\)", flags=re.I)[0])
-    return df.sort_values("Date", kind="stable").reset_index(drop=True)
+def clean_boosting_data(frame: pd.DataFrame) -> pd.DataFrame:
+    """Clean a boosting-services table and extract service duration in days.
+
+    Args:
+        frame: Raw boosting transaction data from Google Sheets.
+
+    Returns:
+        A cleaned data frame with ``Provider``, ``Description``, and ``Days``
+        columns, sorted by transaction date.
+    """
+    required = {"Date", "Amount", "Version", SOURCE_PROVIDER_COLUMN, "Content"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Boosting table is missing required columns: {', '.join(sorted(missing))}.")
+
+    cleaned = frame.copy()
+    cleaned["Date"] = to_date(cleaned["Date"])
+    cleaned["Amount"] = to_number(cleaned["Amount"])
+    cleaned["Version"] = cleaned["Version"].astype("string").fillna("").str.strip()
+    cleaned["Provider"] = cleaned[SOURCE_PROVIDER_COLUMN].astype("string").fillna("").str.strip()
+    cleaned["Content"] = cleaned["Content"].astype("string").fillna("").str.strip()
+    cleaned["Content"] = cleaned["Content"].replace({"Rawat Akun": "Account care"})
+    if SOURCE_DESCRIPTION_COLUMN not in cleaned:
+        cleaned[SOURCE_DESCRIPTION_COLUMN] = ""
+    cleaned["Description"] = cleaned[SOURCE_DESCRIPTION_COLUMN].astype("string").fillna("").str.strip()
+    cleaned["Days"] = pd.to_numeric(
+        cleaned["Description"].str.extract(r"\((\d+)\s*(?:hari|days?)\)", flags=re.IGNORECASE)[0],
+        errors="coerce",
+    )
+    cleaned = cleaned.dropna(subset=["Date", "Amount"])
+    cleaned = cleaned.drop(columns=[SOURCE_PROVIDER_COLUMN, SOURCE_DESCRIPTION_COLUMN], errors="ignore")
+    return cleaned.sort_values("Date", kind="stable").reset_index(drop=True)
 
 
-@st.cache_data(ttl=300)
-def load_sheet():
-    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-    rows = gc.open_by_key(st.secrets["sheet_id"]).worksheet(TAB).get_all_values()
-    games = iter(GAME_ORDER)
-    out = {}
-    for i, r in enumerate(rows):
-        # header tabel: kolom A = "No" / "No.", kolom B = "Date"
-        if len(r) > 1 and r[0].strip() in ("No", "No.") and r[1].strip() == "Date":
-            header = [h.strip() for h in r]
-            while header and not header[-1]:
-                header.pop()
-            body = []
-            for x in rows[i + 1:]:
-                if not x or not x[0].strip().isdigit():  # berhenti di baris total / kosong
-                    break
-                body.append((x + [""] * len(header))[: len(header)])
-            d = pd.DataFrame(body, columns=header)
-            if "Joki" in header:
-                out["Joki"] = clean_joki(d)
-            elif "Item" in header:
-                name = next(games, None)
-                if name:
-                    out[name] = clean_game(d)
-    return {k: out[k] for k in ["Genshin", "HSR", "Joki"] if k in out}
+@st.cache_data(ttl=300, show_spinner="Loading transaction data...")
+def load_sheet_data() -> dict[str, pd.DataFrame]:
+    """Load and clean the game and boosting tables from Google Sheets.
+
+    Returns:
+        A dictionary of cleaned data frames, keyed by game name or
+        ``Boosting``. The result is cached for five minutes.
+
+    Raises:
+        KeyError: When required Streamlit secrets are not configured.
+        ValueError: When a recognised table is missing required columns.
+        gspread exceptions: When the Google Sheets request fails.
+    """
+    credentials = dict(st.secrets["gcp_service_account"])
+    client = gspread.service_account_from_dict(credentials)
+    rows = client.open_by_key(st.secrets["sheet_id"]).worksheet(WORKSHEET_NAME).get_all_values(
+        value_render_option="UNFORMATTED_VALUE"
+    )
+
+    game_names = iter(GAME_ORDER)
+    output: dict[str, pd.DataFrame] = {}
+
+    for row_index, row in enumerate(rows):
+        is_header = (
+            len(row) > 1
+            and str(row[0]).strip() in {"No", "No."}
+            and str(row[1]).strip() == "Date"
+        )
+        if not is_header:
+            continue
+
+        headers = [value.strip() for value in row]
+        while headers and not headers[-1]:
+            headers.pop()
+
+        body = []
+        for candidate in rows[row_index + 1 :]:
+            first_cell = str(candidate[0]).strip() if candidate else ""
+            if not first_cell.isdigit():
+                break
+            body.append((candidate + [""] * len(headers))[: len(headers)])
+
+        raw_frame = pd.DataFrame(body, columns=headers)
+        if SOURCE_PROVIDER_COLUMN in headers:
+            output[BOOSTING_CATEGORY] = clean_boosting_data(raw_frame)
+        elif "Item" in headers:
+            game_name = next(game_names, None)
+            if game_name:
+                output[game_name] = clean_game_data(raw_frame)
+
+    ordered_keys = [*GAME_ORDER, BOOSTING_CATEGORY]
+    return {key: output[key] for key in ordered_keys if key in output}
 
 
-# ----------------------------------------------------------------------- tren
-def add_period(df, period):
-    d = df.copy()
-    if period == "Bulan":
-        d["_p"] = d["Date"].dt.to_period("M").dt.to_timestamp()
-        order = pd.date_range(d["_p"].min(), d["_p"].max(), freq="MS")
-    elif period == "Kuartal":
-        q = d["Date"].dt.to_period("Q")
-        d["_p"] = q.map(lambda x: f"{x.year} Q{x.quarter}")
-        order = pd.Index([f"{x.year} Q{x.quarter}" for x in pd.period_range(q.min(), q.max(), freq="Q")])
-    elif period == "Tahun":
-        d["_p"] = d["Date"].dt.year.astype(str)
-        order = pd.Index(sorted(d["_p"].unique()))
-    else:  # Patch
-        d["_p"] = d["Version"].astype(str)
-        order = pd.Index(sorted(d["_p"].unique(), key=ver_key))
-    return d, order
+# ---------------------------------------------------------------------------
+# Time periods and chart construction
+# ---------------------------------------------------------------------------
+def add_period(frame: pd.DataFrame, period: str) -> tuple[pd.DataFrame, pd.Index]:
+    """Assign a period label to each transaction and return its display order.
 
+    Args:
+        frame: Transactions containing a ``Date`` column and, for patches,
+            a ``Version`` column.
+        period: One of ``Month``, ``Quarter``, ``Year``, or ``Patch``.
 
-def style_fig(fig, period, order, height=380):
-    fig.update_layout(height=height, margin=dict(l=0, r=0, t=10, b=0),
-                      legend=dict(orientation="h", y=-0.22, x=0, title_text=""),
-                      hovermode="x unified", bargap=0.25, xaxis_title=None, yaxis_title=None)
-    fig.update_yaxes(tickprefix="Rp", tickformat="~s", gridcolor="rgba(128,128,128,.2)")
-    if period == "Bulan":
-        fig.update_xaxes(tickformat="%b %Y")
+    Returns:
+        A copied data frame with a ``_period`` column and an ordered index.
+    """
+    period_frame = frame.copy()
+    period_frame = period_frame.dropna(subset=["Date"])
+    if period_frame.empty:
+        period_frame["_period"] = pd.Series(dtype="object")
+        return period_frame, pd.Index([])
+
+    if period == "Month":
+        period_frame["_period"] = period_frame["Date"].dt.to_period("M").dt.to_timestamp()
+        order = pd.date_range(period_frame["_period"].min(), period_frame["_period"].max(), freq="MS")
+    elif period == "Quarter":
+        quarter = period_frame["Date"].dt.to_period("Q")
+        period_frame["_period"] = quarter.map(lambda item: f"{item.year} Q{item.quarter}")
+        order = pd.Index(
+            [f"{item.year} Q{item.quarter}" for item in pd.period_range(quarter.min(), quarter.max(), freq="Q")]
+        )
+    elif period == "Year":
+        period_frame["_period"] = period_frame["Date"].dt.year.astype(str)
+        order = pd.Index(sorted(period_frame["_period"].unique()))
     else:
-        fig.update_xaxes(type="category", categoryorder="array", categoryarray=[str(o) for o in order])
-    return fig
+        period_frame["_period"] = period_frame["Version"].astype(str)
+        order = pd.Index(sorted(period_frame["_period"].unique(), key=version_sort_key))
+    return period_frame, order
 
 
-def spend_chart(df, period, group, cmap=None):
-    d, order = add_period(df, period)
-    p = (d.pivot_table(index="_p", columns=group, values="Amount", aggfunc="sum", fill_value=0)
-          .reindex(order, fill_value=0))
-    p.index.name = "Periode"
-    p.columns.name = None
-    long = p.reset_index().melt(id_vars="Periode", var_name=group, value_name="Amount")
-    fig = px.bar(long, x="Periode", y="Amount", color=group,
-                 color_discrete_map=cmap, color_discrete_sequence=PALETTE)
-    fig.update_traces(hovertemplate="%{fullData.name}: Rp%{y:,.0f}<extra></extra>")
-    if period == "Bulan":
-        tot = p.sum(axis=1)
-        fig.add_scatter(x=tot.index, y=tot.rolling(3, min_periods=1).mean(), mode="lines",
-                        name="Rata-rata 3 bulan", line=dict(color="#d63031", width=3, dash="dot"),
-                        hovertemplate="Rata-rata 3 bln: Rp%{y:,.0f}<extra></extra>")
-    return style_fig(fig, period, order)
+def style_figure(figure: go.Figure, period: str, order: pd.Index, height: int = 380) -> go.Figure:
+    """Apply consistent layout, currency formatting, and period ordering.
+
+    Args:
+        figure: Plotly figure to style.
+        period: Period identifier used to determine the x-axis format.
+        order: Ordered period labels returned by ``add_period``.
+        height: Figure height in pixels.
+
+    Returns:
+        The styled Plotly figure.
+    """
+    figure.update_layout(
+        height=height,
+        margin={"l": 8, "r": 8, "t": 12, "b": 8},
+        legend={"orientation": "h", "y": -0.22, "x": 0, "title_text": ""},
+        hovermode="x unified",
+        bargap=0.25,
+        xaxis_title=None,
+        yaxis_title=None,
+        separators=",.",
+    )
+    figure.update_yaxes(tickprefix="Rp ", tickformat=",.0f", gridcolor="rgba(140, 150, 165, 0.18)")
+    if period == "Month":
+        figure.update_xaxes(tickformat="%b %Y")
+    else:
+        figure.update_xaxes(type="category", categoryorder="array", categoryarray=[str(item) for item in order])
+    return figure
 
 
-def balance_chart(df, period):
-    d, order = add_period(df, period)
-    g = d.groupby("_p")[["Overpay", "Hemat"]].sum().reindex(order, fill_value=0)
-    cum = (g["Overpay"] - g["Hemat"]).cumsum()
-    fig = go.Figure()
-    fig.add_bar(x=g.index, y=g["Overpay"], name="Overpay", marker_color=BAD,
-                hovertemplate="Overpay: Rp%{y:,.0f}<extra></extra>")
-    fig.add_bar(x=g.index, y=-g["Hemat"], name="Hemat", marker_color=GOOD,
-                hovertemplate="Hemat: Rp%{customdata:,.0f}<extra></extra>", customdata=g["Hemat"])
-    fig.add_scatter(x=g.index, y=cum, name="Net kumulatif (kanan)", mode="lines+markers", yaxis="y2",
-                    line=dict(color=ACCENT, width=3),
-                    hovertemplate="Net kumulatif: Rp%{y:,.0f}<extra></extra>")
-    fig.update_layout(barmode="relative",
-                      yaxis2=dict(overlaying="y", side="right", tickprefix="Rp", tickformat="~s", showgrid=False))
-    return style_fig(fig, period, order)
+def create_spending_chart(
+    frame: pd.DataFrame,
+    period: str,
+    group_column: str,
+    colour_map: dict[str, str] | None = None,
+) -> go.Figure:
+    """Create a stacked spending chart with a three-month average when relevant.
+
+    Args:
+        frame: Transaction data containing ``Date``, ``Amount``, and the group
+            column.
+        period: Period identifier: ``Month``, ``Quarter``, ``Year``, or ``Patch``.
+        group_column: Column used to split spending into categories.
+        colour_map: Optional mapping of group labels to colours.
+
+    Returns:
+        A styled Plotly bar chart.
+    """
+    period_frame, order = add_period(frame, period)
+    pivot = (
+        period_frame.pivot_table(
+            index="_period",
+            columns=group_column,
+            values="Amount",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .reindex(order, fill_value=0)
+    )
+    pivot.index.name = "Period"
+    pivot.columns.name = None
+    long_frame = pivot.reset_index().melt(id_vars="Period", var_name=group_column, value_name="Amount")
+
+    figure = px.bar(
+        long_frame,
+        x="Period",
+        y="Amount",
+        color=group_column,
+        color_discrete_map=colour_map,
+        color_discrete_sequence=COLOUR_PALETTE,
+    )
+    figure.update_traces(hovertemplate="%{fullData.name}: Rp %{y:,.0f}<extra></extra>")
+
+    if period == "Month" and not pivot.empty:
+        total_by_period = pivot.sum(axis=1)
+        figure.add_scatter(
+            x=total_by_period.index,
+            y=total_by_period.rolling(3, min_periods=1).mean(),
+            mode="lines",
+            name="Three-month average",
+            line={"color": ACCENT_COLOUR, "width": 2, "dash": "dot"},
+            hovertemplate="Three-month average: Rp %{y:,.0f}<extra></extra>",
+        )
+    return style_figure(figure, period, order)
 
 
-# ------------------------------------------------------------------- statistik
-def window(df, asof, months_from, months_to=0):
-    """transaksi dengan asof-months_from < Date <= asof-months_to"""
-    lo = asof - pd.DateOffset(months=months_from)
-    hi = asof - pd.DateOffset(months=months_to)
-    return df[(df["Date"] > lo) & (df["Date"] <= hi)]
+def create_balance_chart(frame: pd.DataFrame, period: str) -> go.Figure:
+    """Compare overpayments with savings and plot the cumulative net balance.
+
+    Args:
+        frame: Game transactions containing ``Overpay`` and ``Savings``.
+        period: Period identifier used to group the transactions.
+
+    Returns:
+        A styled Plotly chart with positive and negative bars plus a net line.
+    """
+    period_frame, order = add_period(frame, period)
+    grouped = (
+        period_frame.groupby("_period")[["Overpay", "Savings"]]
+        .sum()
+        .reindex(order, fill_value=0)
+    )
+    cumulative_net = (grouped["Overpay"] - grouped["Savings"]).cumsum()
+
+    figure = go.Figure()
+    figure.add_bar(
+        x=grouped.index,
+        y=grouped["Overpay"],
+        name="Overpay",
+        marker_color=OVERPAY_COLOUR,
+        hovertemplate="Overpay: Rp %{y:,.0f}<extra></extra>",
+    )
+    figure.add_bar(
+        x=grouped.index,
+        y=-grouped["Savings"],
+        name="Savings",
+        marker_color=SAVINGS_COLOUR,
+        customdata=grouped["Savings"],
+        hovertemplate="Savings: Rp %{customdata:,.0f}<extra></extra>",
+    )
+    figure.add_scatter(
+        x=grouped.index,
+        y=cumulative_net,
+        name="Cumulative net",
+        mode="lines+markers",
+        yaxis="y2",
+        line={"color": ACCENT_COLOUR, "width": 2},
+        hovertemplate="Cumulative net: Rp %{y:,.0f}<extra></extra>",
+    )
+    figure.update_layout(
+        barmode="relative",
+        yaxis2={"overlaying": "y", "side": "right", "tickprefix": "Rp ", "tickformat": ",.0f", "showgrid": False},
+    )
+    return style_figure(figure, period, order)
 
 
-def trend_sentence(df, asof):
-    last6 = window(df, asof, 6)["Amount"].sum() / 6
-    prev6 = window(df, asof, 12, 6)["Amount"].sum() / 6
-    if prev6 <= 0:
+# ---------------------------------------------------------------------------
+# Statistical calculations and insight generation
+# ---------------------------------------------------------------------------
+def select_window(
+    frame: pd.DataFrame,
+    as_of: pd.Timestamp,
+    months_from: int,
+    months_to: int = 0,
+) -> pd.DataFrame:
+    """Select transactions within a rolling date window.
+
+    Args:
+        frame: Transactions containing a ``Date`` column.
+        as_of: Inclusive end date for the selected window.
+        months_from: Number of months before ``as_of`` for the start boundary.
+        months_to: Number of months before ``as_of`` for the end boundary.
+
+    Returns:
+        Transactions where ``as_of - months_from < Date <= as_of - months_to``.
+    """
+    lower_bound = as_of - pd.DateOffset(months=months_from)
+    upper_bound = as_of - pd.DateOffset(months=months_to)
+    return frame[(frame["Date"] > lower_bound) & (frame["Date"] <= upper_bound)]
+
+
+def build_trend_summary(frame: pd.DataFrame, as_of: pd.Timestamp) -> str | None:
+    """Summarise the change in average monthly spending between two half-years.
+
+    Args:
+        frame: Transactions containing ``Date`` and ``Amount`` columns.
+        as_of: Date used as the end of the comparison windows.
+
+    Returns:
+        A Markdown-ready trend sentence, or None when the earlier period has
+        no positive spend to compare against.
+    """
+    recent_average = select_window(frame, as_of, 6)["Amount"].sum() / 6
+    previous_average = select_window(frame, as_of, 12, 6)["Amount"].sum() / 6
+    if previous_average <= 0:
         return None
-    ch = last6 / prev6 - 1
-    arah = "naik" if ch > 0 else "turun"
-    return (f"Rata-rata belanja 6 bulan terakhir **{rp(last6)}/bulan**, {arah} {abs(ch):.0%} "
-            f"dibanding 6 bulan sebelumnya ({rp(prev6)}/bulan).")
 
-
-def game_stats(df, asof):
-    r12 = window(df, asof, 12)
-    return dict(
-        total=df["Amount"].sum(), n=len(df), over=df["Overpay"].sum(), hemat=df["Hemat"].sum(),
-        hit=(df["Overpay"] == 0).mean(), n12=len(r12), total12=r12["Amount"].sum(),
-        over12=r12["Overpay"].sum(), hit12=(r12["Overpay"] == 0).mean() if len(r12) else float("nan"),
+    change = recent_average / previous_average - 1
+    if change > 0:
+        direction = "increased"
+    elif change < 0:
+        direction = "decreased"
+    else:
+        direction = "remained unchanged"
+    return (
+        f"Average monthly spending over the last six months was **{format_rupiah(recent_average)}**, "
+        f"{direction} by **{abs(change):.0%}** compared with the preceding six months "
+        f"({format_rupiah(previous_average)} per month)."
     )
 
 
-def game_insights(df, asof):
-    s = game_stats(df, asof)
-    ks, ss = [], []
-    net = s["over"] - s["hemat"]
-    pct_over = s["over"] / s["total"] if s["total"] else 0
-    ks.append(f"Total belanja **{rp(s['total'])}** dari {s['n']} transaksi; overpay terhadap acuan 70% "
-              f"**{rp(s['over'])}** ({pct_over:.1%} dari belanja).")
+def calculate_game_stats(frame: pd.DataFrame, as_of: pd.Timestamp) -> dict[str, Any]:
+    """Calculate lifetime and trailing 12-month metrics for a game.
+
+    Args:
+        frame: Cleaned game transaction data.
+        as_of: Date used to calculate the trailing 12-month period.
+
+    Returns:
+        A dictionary containing spend, transaction, overpay, saving, and hit-rate
+        statistics.
+    """
+    recent = select_window(frame, as_of, 12)
+    comparable = frame[frame["Reference"].notna()]
+    recent_comparable = recent[recent["Reference"].notna()]
+    return {
+        "total": frame["Amount"].sum(),
+        "count": len(frame),
+        "overpay": frame["Overpay"].sum(),
+        "savings": frame["Savings"].sum(),
+        "hit_rate": (comparable["Overpay"] == 0).mean() if len(comparable) else float("nan"),
+        "recent_count": len(recent),
+        "recent_total": recent["Amount"].sum(),
+        "recent_overpay": recent["Overpay"].sum(),
+        "recent_hit_rate": (recent_comparable["Overpay"] == 0).mean() if len(recent_comparable) else float("nan"),
+    }
+
+
+def build_game_insights(frame: pd.DataFrame, as_of: pd.Timestamp) -> tuple[list[str], list[dict[str, Any]]]:
+    """Generate game-spending conclusions and cost-saving recommendations.
+
+    Args:
+        frame: Cleaned game transaction data.
+        as_of: Date used for rolling 12-month comparisons.
+
+    Returns:
+        A pair containing conclusion strings and recommendation dictionaries.
+        Each recommendation has ``text`` and estimated ``est`` savings.
+    """
+    conclusions: list[str] = []
+    recommendations: list[dict[str, Any]] = []
+    stats = calculate_game_stats(frame, as_of)
+    net = stats["overpay"] - stats["savings"]
+    overpay_share = stats["overpay"] / stats["total"] if stats["total"] else 0
+
+    conclusions.append(
+        f"Total spending was **{format_rupiah(stats['total'])}** across {stats['count']} transactions. "
+        f"Overpayment against the 70% reference was **{format_rupiah(stats['overpay'])}** "
+        f"({overpay_share:.1%} of total spending)."
+    )
     if net > 0:
-        ks.append(f"Secara bersih masih **boros {rp(net)}**: penghematan ({rp(s['hemat'])}) belum menutup overpay.")
+        conclusions.append(
+            f"The net position is **{format_rupiah(net)} in overpayments**; savings "
+            f"({format_rupiah(stats['savings'])}) have not offset the excess spend."
+        )
     else:
-        ks.append(f"Secara bersih sudah **hemat {rp(-net)}**: penghematan ({rp(s['hemat'])}) melebihi overpay.")
-    hit_txt = f"{s['hit']:.0%} transaksi berada dibawah acuan"
-    if s["n12"]:
-        hit_txt += f"; dalam 12 bulan terakhir {s['hit12']:.0%} ({s['n12']} transaksi)"
-    ks.append(hit_txt + ".")
-    t = trend_sentence(df, asof)
-    if t:
-        ks.append(t)
+        conclusions.append(
+            f"The net position is **{format_rupiah(-net)} in savings**; savings "
+            f"({format_rupiah(stats['savings'])}) exceed overpayments."
+        )
 
-    cut12 = asof - pd.DateOffset(months=12)
-    sh = df.groupby("Toko").agg(n=("Amount", "size"), over=("Overpay", "sum"), hemat=("Hemat", "sum"),
-                                last=("Date", "max"),
-                                n_over=("Overpay", lambda x: int((x > 0).sum()))).reset_index()
-    sh["net"] = sh["over"] - sh["hemat"]
-    pool = sh[sh["n"] >= 3] if (sh["n"] >= 3).any() else sh
-    best = pool.nsmallest(1, "net").iloc[0]
-    if best["net"] < 0:
-        ks.append(f"Toko paling menguntungkan: **{best['Toko']}** (net hemat {rp(-best['net'])} dari {best['n']} transaksi).")
-    worst = sh.nlargest(1, "net").iloc[0]
-    if worst["net"] > 0:
-        ks.append(f"Toko paling boros: **{worst['Toko']}** (net overpay {rp(worst['net'])} dari {worst['n']} transaksi).")
-    old = sh[(sh["over"] > 0) & (sh["last"] <= cut12)]
-    if len(old):
-        ks.append("Toko dengan riwayat overpay yang sudah tidak dipakai 12 bulan terakhir: "
-                  + ", ".join(f"**{x}**" for x in old["Toko"]) + " (pertahankan tidak dipakai).")
-    r12 = window(df, asof, 12)
-    if len(r12) and r12["Overpay"].max() > 0:
-        r = r12.loc[r12["Overpay"].idxmax()]
-        ks.append(f"Overpay terbesar 12 bulan terakhir: **{r['Item']}** di {r['Toko']} "
-                  f"({r['Date']:%d %b %Y}), {rp(r['Overpay'])} di atas acuan.")
-
-    # ----- saran
-    top = df.groupby("Item").agg(total=("Amount", "sum"), acuan=("Acuan", "last")).nlargest(3, "total")
-    lim = ", ".join(f"{i} {rp(r['acuan'])}" for i, r in top.iterrows())
-    if s["over12"] > 0:
-        ss.append(dict(text=f"Pasang **batas harga maksimal** sebelum membeli: {lim}. Overpay 12 bulan terakhir "
-                            f"{rp(s['over12'])}.", est=s["over12"]))
-    else:
-        ss.append(dict(text=f"Pertahankan disiplin harga (batas maksimal: {lim}); tidak ada overpay dalam 12 bulan terakhir.",
-                       est=0))
-    risky = sh[(sh["over"] > 0) & (sh["last"] > cut12)].nlargest(2, "over")
-    for _, r in risky.iterrows():
-        ss.append(dict(text=f"Beli di **{r['Toko']}** hanya jika harga ≤ acuan: {r['n_over']} dari {r['n']} transaksi "
-                            f"overpay (total {rp(r['over'])}), terakhir dipakai {r['last']:%d %b %Y}.", est=0))
-    promo = df[df["Hemat"] >= 0.2 * df["Acuan"]]
-    if len(promo):
-        pg = promo.groupby("Item").agg(k=("Amount", "size"), med=("Amount", "median"), last=("Date", "max"),
-                                       toko=("Toko", lambda x: x.mode().iloc[0])).nlargest(1, "k")
-        for item, r in pg.iterrows():
-            if r["k"] >= 2:
-                ss.append(dict(text=f"**{item}** beberapa kali promo: {r['k']}x dibeli ≥20% di bawah acuan "
-                                    f"(median {rp(r['med'])}, paling sering di {r['toko']}, terakhir {r['last']:%d %b %Y}). "
-                                    "Jika stok aman, tunda pembelian sampai promo muncul.", est=0))
-    return ks, ss
-
-
-def joki_insights(df, asof):
-    ks, ss = [], []
-    total, n = df["Amount"].sum(), len(df)
-    byj = df.groupby("Joki")["Amount"].agg(["sum", "size"]).sort_values("sum", ascending=False)
-    byc = df.groupby("Content")["Amount"].agg(["sum", "size"]).sort_values("sum", ascending=False)
-    singles = int((byj["size"] == 1).sum())
-    ks.append(f"Total jasa joki **{rp(total)}** dari {n} transaksi ke {len(byj)} penjoki; rata-rata {rp(total / n)} per transaksi.")
-    ks.append(f"PenJoki terbesar: **{byj.index[0]}** ({byj['sum'].iloc[0] / total:.0%} dari total); "
-              f"{singles} dari {len(byj)} jasa joki hanya dipakai 1x.")
-    if len(byc) >= 2:
-        ks.append(f"Konten terbesar: **{byc.index[0]}** ({byc['sum'].iloc[0] / total:.0%}) dan "
-                  f"**{byc.index[1]}** ({byc['sum'].iloc[1] / total:.0%}).")
-    t = trend_sentence(df, asof)
-    if t:
-        ks.append(t)
-
-    cut12 = asof - pd.DateOffset(months=12)
-    ra = df[(df["Content"] == "Rawat Akun") & df["Hari"].notna()].copy()
-    if len(ra) >= 2:
-        ra["PerHari"] = ra["Amount"] / ra["Hari"]
-        mn, mx = ra["PerHari"].min(), ra["PerHari"].max()
-        cheap = ra.loc[ra["PerHari"].idxmin(), "Joki"]
-        ks.append(f"Rawat Akun: tarif per hari berkisar {rp(mn)} sampai {rp(mx)} ({cheap} termurah).")
-        r12 = ra[ra["Date"] > cut12]
-        est = ((r12["PerHari"] - mn) * r12["Hari"]).sum()
-        if est > 0:
-            ss.append(dict(text=f"Untuk **Rawat Akun**, bandingkan tarif per hari sebelum memesan. Memakai tarif "
-                                f"termurah ({rp(mn)}/hari, {cheap}) pada pemesanan 12 bulan terakhir.", est=est))
-    est_rec, notes = 0.0, []
-    for c in RECURRING:
-        d = df[df["Content"] == c]
-        if len(d) < 3:
-            continue
-        med = d["Amount"].median()
-        est_rec += (d[d["Date"] > cut12]["Amount"] - med).clip(lower=0).sum()
-        g = d.groupby("Joki")["Amount"].agg(["median", "size"])
-        g = g[g["size"] >= 2]
-        if len(g) >= 2:
-            notes.append(f"{c}: {g['median'].idxmin()} (median {rp(g['median'].min())})")
-    if est_rec > 0 or notes:
-        txt = ("Untuk layanan berulang (" + ", ".join(RECURRING) + "), anggap **median** sebagai harga wajar dan "
-               "tolak harga jauh di atasnya.")
-        if notes:
-            txt += " Joki termurah (≥2 transaksi): " + "; ".join(notes) + "."
-        ss.append(dict(text=txt, est=est_rec))
-    if singles >= 5:
-        ss.append(dict(text=f"Kurangi joki sekali pakai ({singles} joki hanya 1 transaksi). Pilih 2-3 joki langganan "
-                            "agar harga mudah dibandingkan.", est=0))
-    return ks, ss
-
-
-# --------------------------------------------------------------------- render
-def render_summary(data, asof):
-    frames = [d[["Date", "Amount"]].assign(Kategori=k) for k, d in data.items()]
-    allx = pd.concat(frames, ignore_index=True)
-    total = allx["Amount"].sum()
-    y = asof.year
-    ytd = allx[allx["Date"].dt.year == y]["Amount"].sum()
-    prev_ytd = allx[(allx["Date"].dt.year == y - 1) & (allx["Date"] <= asof - pd.DateOffset(years=1))]["Amount"].sum()
-    avg12 = window(allx, asof, 12)["Amount"].sum() / 12
-    avg_prev = window(allx, asof, 24, 12)["Amount"].sum() / 12
-
-    ins = {k: (game_insights(d, asof) if k != "Joki" else joki_insights(d, asof)) for k, d in data.items()}
-    est_total = sum(it["est"] for _, ss in ins.values() for it in ss)
-    over12 = sum(window(d, asof, 12)["Overpay"].sum() for k, d in data.items() if k != "Joki")
-    topup12 = sum(window(d, asof, 12)["Amount"].sum() for k, d in data.items() if k != "Joki")
-    joki_total = data["Joki"]["Amount"].sum() if "Joki" in data else 0
-
-    c = st.columns(3)
-    kpi(c[0], "Total pengeluaran", rp(total), f"{allx['Date'].min():%b %Y} - {allx['Date'].max():%b %Y} · {len(allx)} transaksi")
-    if prev_ytd > 0:
-        ch = ytd / prev_ytd - 1
-        kpi(c[1], f"Tahun {y} (sampai {asof:%d %b})", rp(ytd),
-            f"{'naik' if ch > 0 else 'turun'} {abs(ch):.0%} vs periode sama {y - 1} ({rp(prev_ytd)})",
-            "bad" if ch > 0 else "good")
-    else:
-        kpi(c[1], f"Tahun {y} (sampai {asof:%d %b})", rp(ytd), "")
-    kpi(c[2], "Rata-rata per bulan (12 bln)", rp(avg12),
-        f"12 bulan sebelumnya {rp(avg_prev)}", "bad" if avg12 > avg_prev > 0 else "good")
-    c = st.columns(3)
-    kpi(c[0], "Overpay top-up (12 bln)", rp(over12),
-        f"{over12 / topup12:.1%} dari belanja top-up" if topup12 else "", "bad" if over12 > 0 else "good")
-    kpi(c[1], "Porsi joki", f"{joki_total / total:.0%}" if total else "-", f"{rp(joki_total)} sepanjang waktu")
-    kpi(c[2], "Estimasi potensi hemat (12 bln)", rp(est_total), "dari saran di bawah", "good" if est_total > 0 else "")
-
-    st.subheader("Tren pengeluaran")
-    left, right = st.columns([3, 1])
-    label = left.radio("Periode", list(PERIODS_NOPATCH), horizontal=True, key="p_sum", label_visibility="collapsed")
-    left.plotly_chart(spend_chart(allx, PERIODS_NOPATCH[label], "Kategori", CAT_COLORS), key="sp_sum")
-    share = allx.groupby("Kategori")["Amount"].sum().reset_index()
-    fig = px.pie(share, names="Kategori", values="Amount", hole=0.6, color="Kategori", color_discrete_map=CAT_COLORS)
-    fig.update_traces(textinfo="percent", hovertemplate="%{label}: Rp%{value:,.0f}<extra></extra>")
-    fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=-0.1))
-    right.plotly_chart(fig, key="pie_sum")
-
-    st.subheader("Kesimpulan dan saran")
-    shares = " · ".join(f"{k} {d['Amount'].sum() / total:.0%}" for k, d in data.items())
-    top_lines = [f"Pengeluaran total **{rp(total)}** ({shares})."]
-    if prev_ytd > 0:
-        top_lines.append(f"Tahun {y} sampai {asof:%d %b}: **{rp(ytd)}**, {'naik' if ytd > prev_ytd else 'turun'} "
-                         f"{abs(ytd / prev_ytd - 1):.0%} dibanding periode sama {y - 1}.")
-    if topup12:
-        top_lines.append(f"Overpay top-up 12 bulan terakhir **{rp(over12)}** ({over12 / topup12:.1%} dari belanja top-up).")
-    bullets(top_lines)
-
-    kc, sc = st.columns(2)
-    kc.markdown("#### Kesimpulan")
-    sc.markdown("#### Saran penghematan berikutnya")
-    for k, (ks, ss) in ins.items():
-        with kc:
-            st.markdown(f"**{k}**")
-            bullets(ks[:3])
-        with sc:
-            st.markdown(f"**{k}**")
-            bullets(saran_text(ss, 3))
-    st.caption("Acuan top-up = kolom '70% Value' di sheet. Estimasi hemat dihitung dari transaksi 12 bulan terakhir "
-               "dan hanya perkiraan, bukan jaminan.")
-
-
-def render_game(df, name, asof):
-    s = game_stats(df, asof)
-    net = s["over"] - s["hemat"]
-    c = st.columns(6)
-    kpi(c[0], "Total belanja", rp(s["total"]), f"{s['n']} transaksi")
-    kpi(c[1], "Rata-rata per patch", rp(df.groupby("Version")["Amount"].sum().mean()), f"{df['Version'].nunique()} patch")
-    kpi(c[2], "Overpay", rp(s["over"]), f"{s['over'] / s['total']:.1%} dari belanja", "bad")
-    kpi(c[3], "Hemat", rp(s["hemat"]), "di bawah acuan", "good")
-    kpi(c[4], "Net", ("Boros " if net > 0 else "Hemat ") + rp(abs(net)), "overpay dikurangi hemat",
-        "bad" if net > 0 else "good")
-    kpi(c[5], "Hit rate ≤ acuan", f"{s['hit']:.0%}", f"12 bln terakhir: {s['hit12']:.0%}" if s["n12"] else "")
-
-    st.subheader("Tren")
-    label = st.radio("Periode", list(PERIODS), horizontal=True, key=f"p_{name}", label_visibility="collapsed")
-    period = PERIODS[label]
-    a, b = st.columns([3, 2])
-    a.markdown("**Belanja per item**")
-    a.plotly_chart(spend_chart(df, period, "Item"), key=f"sp_{name}")
-    b.markdown("**Overpay vs hemat**")
-    b.plotly_chart(balance_chart(df, period), key=f"bal_{name}")
-
-    st.subheader("Toko dan item")
-    a, b = st.columns([2, 3])
-    sh = df.groupby("Toko").agg(n=("Amount", "size"), Overpay=("Overpay", "sum"), Hemat=("Hemat", "sum")).reset_index()
-    sh["Net"] = sh["Overpay"] - sh["Hemat"]
-    sh["Status"] = sh["Net"].map(lambda x: "Boros" if x > 0 else "Hemat")
-    sh = sh.sort_values("Net")
-    fig = px.bar(sh, x="Net", y="Toko", orientation="h", color="Status",
-                 color_discrete_map={"Boros": BAD, "Hemat": GOOD}, text=sh["n"].map(lambda v: f"{v}x"))
-    fig.update_layout(height=max(300, 34 * len(sh) + 80), margin=dict(l=0, r=0, t=10, b=0),
-                      legend=dict(orientation="h", y=-0.15, title_text=""), xaxis_title="Net (+ boros, - hemat)",
-                      yaxis_title=None)
-    fig.update_xaxes(tickprefix="Rp", tickformat="~s")
-    a.markdown("**Net per toko**")
-    a.plotly_chart(fig, key=f"shop_{name}")
-
-    it = df.groupby("Item").agg(Transaksi=("Amount", "size"), Total=("Amount", "sum"), Rata=("Amount", "mean"),
-                                Acuan=("Acuan", "last"), HitRate=("Overpay", lambda x: (x == 0).mean() * 100),
-                                Overpay=("Overpay", "sum"), Hemat=("Hemat", "sum")).reset_index()
-    it = it.sort_values("Total", ascending=False)
-    disp = fmt_table(it, money=["Total", "Rata", "Acuan", "Overpay", "Hemat"])
-    b.markdown("**Per item (Acuan = batas harga maksimal)**")
-    b.dataframe(disp, hide_index=True, column_config={
-        "Rata": st.column_config.Column("Rata-rata"),
-        "HitRate": st.column_config.ProgressColumn("Hit rate", min_value=0, max_value=100, format="%.0f%%"),
-    })
-
-    st.subheader("Promo dan overpay")
-    a, b = st.columns(2)
-    promo = df[df["Hemat"] >= 0.2 * df["Acuan"]][["Date", "Item", "Toko", "Amount", "Hemat"]]
-    a.markdown("**Promo besar (≥20% di bawah acuan)**")
-    a.dataframe(fmt_table(promo.sort_values("Date", ascending=False), ["Amount", "Hemat"]), hide_index=True)
-    top = df[df["Overpay"] > 0].nlargest(10, "Overpay")[["Date", "Item", "Toko", "Amount", "Overpay"]]
-    b.markdown("**10 overpay terbesar**")
-    b.dataframe(fmt_table(top, ["Amount", "Overpay"]), hide_index=True)
-
-    ks, ss = game_insights(df, asof)
-    st.subheader("Kesimpulan dan saran")
-    k, sa = st.columns(2)
-    k.markdown("#### Kesimpulan")
-    with k:
-        bullets(ks)
-    sa.markdown("#### Saran penghematan")
-    with sa:
-        bullets(saran_text(ss))
-
-    with st.expander("Detail transaksi"):
-        f1, f2 = st.columns(2)
-        ft = f1.multiselect("Toko", sorted(df["Toko"].unique()), key=f"ft_{name}")
-        fi = f2.multiselect("Item", sorted(df["Item"].unique()), key=f"fi_{name}")
-        mask = pd.Series(True, index=df.index)
-        if ft:
-            mask &= df["Toko"].isin(ft)
-        if fi:
-            mask &= df["Item"].isin(fi)
-        v = df[mask]
-        st.dataframe(fmt_table(v.drop(columns=["No"], errors="ignore"),
-                               ["Amount", "Acuan", "Selisih", "Overpay", "Hemat"]), hide_index=True)
-
-
-def render_joki(df, asof):
-    total, n = df["Amount"].sum(), len(df)
-    ra = df[(df["Content"] == "Rawat Akun") & df["Hari"].notna()].copy()
-    ra["PerHari"] = ra["Amount"] / ra["Hari"]
-    c = st.columns(5)
-    kpi(c[0], "Total joki", rp(total), f"{n} transaksi")
-    kpi(c[1], "Joki berbeda", f"{df['Joki'].nunique()}", f"{int((df['Joki'].value_counts() == 1).sum())} hanya 1x")
-    kpi(c[2], "Rata-rata / transaksi", rp(total / n), f"median {rp(df['Amount'].median())}")
-    kpi(c[3], "12 bulan terakhir", rp(window(df, asof, 12)["Amount"].sum()),
-        f"{len(window(df, asof, 12))} transaksi")
-    kpi(c[4], "Rawat Akun / hari (median)", rp(ra["PerHari"].median()) if len(ra) else "-",
-        f"{len(ra)} pemesanan" if len(ra) else "")
-
-    st.subheader("Tren")
-    label = st.radio("Periode", list(PERIODS), horizontal=True, key="p_Joki", label_visibility="collapsed")
-    a, b = st.columns([3, 2])
-    a.markdown("**Pengeluaran per konten**")
-    a.plotly_chart(spend_chart(df, PERIODS[label], "Content"), key="sp_Joki")
-    bj = df.groupby("Joki")["Amount"].agg(Total="sum", N="size").sort_values("Total").tail(10).reset_index()
-    fig = px.bar(bj, x="Total", y="Joki", orientation="h", text=bj["N"].map(lambda v: f"{v}x"),
-                 color_discrete_sequence=[ACCENT])
-    fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0), xaxis_title=None, yaxis_title=None)
-    fig.update_xaxes(tickprefix="Rp", tickformat="~s")
-    b.markdown("**10 joki terbesar (jumlah transaksi di ujung bar)**")
-    b.plotly_chart(fig, key="joki_top")
-
-    st.subheader("Harga per konten")
-    a, b = st.columns([3, 2])
-    ct = df.groupby("Content")["Amount"].agg(Total="sum", N="size", Median="median", Rata="mean", Maks="max")
-    ct = ct.sort_values("Total", ascending=False).reset_index()
-    a.dataframe(fmt_table(ct, ["Total", "Median", "Rata", "Maks"]), hide_index=True,
-                column_config={"Rata": st.column_config.Column("Rata-rata")})
-    if len(ra):
-        fig = px.scatter(ra, x="Date", y="PerHari", color="Joki", size="Hari", size_max=22,
-                         color_discrete_sequence=PALETTE)
-        fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), xaxis_title=None, yaxis_title=None,
-                          legend=dict(orientation="h", y=-0.25, title_text=""))
-        fig.update_yaxes(tickprefix="Rp", tickformat="~s")
-        b.markdown("**Rawat Akun: tarif per hari (ukuran = jumlah hari)**")
-        b.plotly_chart(fig, key="ra_scatter")
-
-    ks, ss = joki_insights(df, asof)
-    st.subheader("Kesimpulan dan saran")
-    k, sa = st.columns(2)
-    k.markdown("#### Kesimpulan")
-    with k:
-        bullets(ks)
-    sa.markdown("#### Saran penghematan")
-    with sa:
-        bullets(saran_text(ss))
-
-    with st.expander("Detail transaksi"):
-        f1, f2 = st.columns(2)
-        fj = f1.multiselect("Joki", sorted(df["Joki"].unique()), key="fj_Joki")
-        fc = f2.multiselect("Content", sorted(df["Content"].unique()), key="fc_Joki")
-        mask = pd.Series(True, index=df.index)
-        if fj:
-            mask &= df["Joki"].isin(fj)
-        if fc:
-            mask &= df["Content"].isin(fc)
-        v = df[mask]
-        st.dataframe(fmt_table(v.drop(columns=["No"], errors="ignore"), ["Amount"]), hide_index=True)
-
-
-# ----------------------------------------------------------------------- main
-st.markdown(CSS, unsafe_allow_html=True)
-if st.sidebar.button("Refresh data"):
-    st.cache_data.clear()
-
-try:
-    data = load_sheet()
-except Exception as e:
-    st.error(f"Gagal membaca Google Sheets: {e}")
-    st.stop()
-
-if not data:
-    st.warning(f"Tidak ada tabel yang dikenali di tab '{TAB}'. Header tabel harus diawali kolom 'No' dan 'Date'.")
-    st.stop()
-
-asof = max(d["Date"].max() for d in data.values())
-st.markdown(
-    f'<div class="hero"><div class="t">💸 Dashboard Pengeluaran Game</div>'
-    f'<div class="s">Transaksi terakhir {asof:%d %B %Y} · tabel terbaca: {", ".join(data)}</div></div>',
-    unsafe_allow_html=True,
-)
-
-tabs = st.tabs(["📊 Ringkasan"] + list(data))
-with tabs[0]:
-    render_summary(data, asof)
-for tab, (name, df) in zip(tabs[1:], data.items()):
-    with tab:
-        if name == "Joki":
-            render_joki(df, asof)
+    hit_rate_text = (
+        f"{stats['hit_rate']:.0%} of comparable transactions were at or below the reference price."
+        if pd.notna(stats["hit_rate"])
+        else "A hit rate is unavailable because reference prices are missing."
+    )
+    if stats["recent_count"]:
+        if pd.notna(stats["recent_hit_rate"]):
+            hit_rate_text += (
+                f" Over the last 12 months: {stats['recent_hit_rate']:.0%} "
+                f"across {stats['recent_count']} transactions."
+            )
         else:
-            render_game(df, name, asof)
+            hit_rate_text += f" There were {stats['recent_count']} transactions in the last 12 months."
+    conclusions.append(hit_rate_text)
+
+    trend = build_trend_summary(frame, as_of)
+    if trend:
+        conclusions.append(trend)
+
+    cutoff = as_of - pd.DateOffset(months=12)
+    shop_summary = (
+        frame.groupby("Shop")
+        .agg(
+            transactions=("Amount", "size"),
+            overpay=("Overpay", "sum"),
+            savings=("Savings", "sum"),
+            last_used=("Date", "max"),
+            overpay_count=("Overpay", lambda values: int((values > 0).sum())),
+        )
+        .reset_index()
+    )
+    if not shop_summary.empty:
+        shop_summary["net"] = shop_summary["overpay"] - shop_summary["savings"]
+        eligible_shops = shop_summary[shop_summary["transactions"] >= 3]
+        comparison_shops = eligible_shops if not eligible_shops.empty else shop_summary
+        best_shop = comparison_shops.nsmallest(1, "net").iloc[0]
+        if best_shop["net"] < 0:
+            conclusions.append(
+                f"Best-value shop: **{best_shop['Shop']}**, with net savings of "
+                f"{format_rupiah(-best_shop['net'])} across {best_shop['transactions']} transactions."
+            )
+
+        worst_shop = shop_summary.nlargest(1, "net").iloc[0]
+        if worst_shop["net"] > 0:
+            conclusions.append(
+                f"Highest-overpay shop: **{worst_shop['Shop']}**, with net overpayments of "
+                f"{format_rupiah(worst_shop['net'])} across {worst_shop['transactions']} transactions."
+            )
+
+        inactive_shops = shop_summary[(shop_summary["overpay"] > 0) & (shop_summary["last_used"] <= cutoff)]
+        if not inactive_shops.empty:
+            shop_names = ", ".join(f"**{shop}**" for shop in inactive_shops["Shop"])
+            conclusions.append(
+                "Shops with a history of overpayment but no purchases in the last 12 months: "
+                f"{shop_names}. Consider maintaining this restriction."
+            )
+
+        risky_shops = shop_summary[(shop_summary["overpay"] > 0) & (shop_summary["last_used"] > cutoff)]
+        risky_shops = risky_shops.nlargest(2, "overpay")
+        for _, shop in risky_shops.iterrows():
+            recommendations.append(
+                {
+                    "text": (
+                        f"Use **{shop['Shop']}** only when the price is at or below the reference: "
+                        f"{shop['overpay_count']} of {shop['transactions']} transactions involved overpayment "
+                        f"(total {format_rupiah(shop['overpay'])}); last used {shop['last_used']:%d %b %Y}."
+                    ),
+                    "est": 0,
+                }
+            )
+
+    recent_transactions = select_window(frame, as_of, 12)
+    if not recent_transactions.empty and recent_transactions["Overpay"].max() > 0:
+        largest_overpay = recent_transactions.loc[recent_transactions["Overpay"].idxmax()]
+        conclusions.append(
+            f"Largest overpayment in the last 12 months: **{largest_overpay['Item']}** at "
+            f"{largest_overpay['Shop']} on {largest_overpay['Date']:%d %b %Y} "
+            f"({format_rupiah(largest_overpay['Overpay'])} above the reference)."
+        )
+
+    top_items = (
+        frame.groupby("Item")
+        .agg(total=("Amount", "sum"), reference=("Reference", "last"))
+        .nlargest(3, "total")
+    )
+    price_limits = ", ".join(
+        f"{item}: {format_rupiah(row['reference'])}" for item, row in top_items.iterrows()
+    )
+    if stats["recent_overpay"] > 0:
+        recommendations.append(
+            {
+                "text": (
+                    f"Set a **maximum purchase price** in advance: {price_limits}. "
+                    f"Overpayments in the last 12 months totalled {format_rupiah(stats['recent_overpay'])}."
+                ),
+                "est": stats["recent_overpay"],
+            }
+        )
+    elif price_limits:
+        recommendations.append(
+            {
+                "text": (
+                    f"Maintain disciplined pricing (maximum reference prices: {price_limits}); "
+                    "there has been no overpayment in the last 12 months."
+                ),
+                "est": 0,
+            }
+        )
+
+    promotional_transactions = frame[
+        frame["Reference"].notna() & (frame["Savings"] >= 0.2 * frame["Reference"])
+    ]
+    if not promotional_transactions.empty:
+        promotion_summary = (
+            promotional_transactions.groupby("Item")
+            .agg(
+                purchases=("Amount", "size"),
+                median_price=("Amount", "median"),
+                last_purchase=("Date", "max"),
+                most_common_shop=("Shop", lambda values: values.mode().iloc[0] if not values.mode().empty else "Unknown"),
+            )
+            .nlargest(1, "purchases")
+        )
+        for item, promotion in promotion_summary.iterrows():
+            if promotion["purchases"] >= 2:
+                recommendations.append(
+                    {
+                        "text": (
+                            f"**{item}** has been purchased at least 20% below its reference price "
+                            f"{promotion['purchases']} times (median {format_rupiah(promotion['median_price'])}; "
+                            f"most often at {promotion['most_common_shop']}; last purchased "
+                            f"{promotion['last_purchase']:%d %b %Y}). Consider waiting for another promotion "
+                            "when your stock allows."
+                        ),
+                        "est": 0,
+                    }
+                )
+    return conclusions, recommendations
+
+
+def build_boosting_insights(
+    frame: pd.DataFrame,
+    as_of: pd.Timestamp,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Generate conclusions and savings recommendations for boosting services.
+
+    Args:
+        frame: Cleaned boosting transactions.
+        as_of: Date used for rolling 12-month comparisons.
+
+    Returns:
+        A pair containing conclusion strings and recommendation dictionaries.
+    """
+    conclusions: list[str] = []
+    recommendations: list[dict[str, Any]] = []
+    total_spend = frame["Amount"].sum()
+    transaction_count = len(frame)
+    provider_summary = (
+        frame.groupby("Provider")["Amount"]
+        .agg(total="sum", transactions="size")
+        .sort_values("total", ascending=False)
+    )
+    content_summary = (
+        frame.groupby("Content")["Amount"]
+        .agg(total="sum", transactions="size")
+        .sort_values("total", ascending=False)
+    )
+    one_time_providers = int((provider_summary["transactions"] == 1).sum())
+
+    average_spend = total_spend / transaction_count if transaction_count else 0
+    conclusions.append(
+        f"Total boosting spend was **{format_rupiah(total_spend)}** across {transaction_count} transactions "
+        f"with {len(provider_summary)} providers; average spend was {format_rupiah(average_spend)} per transaction."
+    )
+    if not provider_summary.empty and total_spend > 0:
+        leading_provider = provider_summary.index[0]
+        leading_share = provider_summary["total"].iloc[0] / total_spend
+        conclusions.append(
+            f"Highest-spend provider: **{leading_provider}** ({leading_share:.0%} of total spend). "
+            f"{one_time_providers} of {len(provider_summary)} providers were used only once."
+        )
+    if len(content_summary) >= 2 and total_spend > 0:
+        first_share = content_summary["total"].iloc[0] / total_spend
+        second_share = content_summary["total"].iloc[1] / total_spend
+        conclusions.append(
+            f"Highest-spend service types: **{content_summary.index[0]}** ({first_share:.0%}) and "
+            f"**{content_summary.index[1]}** ({second_share:.0%})."
+        )
+
+    trend = build_trend_summary(frame, as_of)
+    if trend:
+        conclusions.append(trend)
+
+    cutoff = as_of - pd.DateOffset(months=12)
+    account_care = frame[
+        (frame["Content"] == "Account care") & frame["Days"].notna() & (frame["Days"] > 0)
+    ].copy()
+    if not account_care.empty:
+        account_care["Daily rate"] = account_care["Amount"] / account_care["Days"]
+        cheapest_rate = account_care["Daily rate"].min()
+        highest_rate = account_care["Daily rate"].max()
+        cheapest_provider = account_care.loc[account_care["Daily rate"].idxmin(), "Provider"]
+        conclusions.append(
+            f"Account care daily rates range from {format_rupiah(cheapest_rate)} to "
+            f"{format_rupiah(highest_rate)}; the lowest recorded rate was from **{cheapest_provider}**."
+        )
+        recent_account_care = account_care[account_care["Date"] > cutoff]
+        estimated_saving = (
+            (recent_account_care["Daily rate"] - cheapest_rate) * recent_account_care["Days"]
+        ).clip(lower=0).sum()
+        if estimated_saving > 0:
+            recommendations.append(
+                {
+                    "text": (
+                        f"For **account care**, compare daily rates before booking. Applying the lowest recorded "
+                        f"rate ({format_rupiah(cheapest_rate)} per day from {cheapest_provider}) to bookings "
+                        "made in the last 12 months would reduce costs."
+                    ),
+                    "est": estimated_saving,
+                }
+            )
+
+    estimated_recurring_saving = 0.0
+    provider_notes = []
+    for service in RECURRING_SERVICES:
+        service_frame = frame[frame["Content"] == service]
+        if len(service_frame) < 3:
+            continue
+
+        median_price = service_frame["Amount"].median()
+        recent_service = service_frame[service_frame["Date"] > cutoff]
+        estimated_recurring_saving += (recent_service["Amount"] - median_price).clip(lower=0).sum()
+
+        provider_prices = service_frame.groupby("Provider")["Amount"].agg(median="median", transactions="size")
+        repeat_providers = provider_prices[provider_prices["transactions"] >= 2]
+        if len(repeat_providers) >= 2:
+            lowest_provider = repeat_providers["median"].idxmin()
+            lowest_median = repeat_providers["median"].min()
+            provider_notes.append(f"{service}: {lowest_provider} (median {format_rupiah(lowest_median)})")
+
+    if estimated_recurring_saving > 0 or provider_notes:
+        recommendation_text = (
+            "For recurring services ("
+            + ", ".join(RECURRING_SERVICES)
+            + "), use the median price as a benchmark and challenge quotes that are materially higher."
+        )
+        if provider_notes:
+            recommendation_text += " Lowest-priced repeat providers: " + "; ".join(provider_notes) + "."
+        recommendations.append({"text": recommendation_text, "est": estimated_recurring_saving})
+
+    if one_time_providers >= 5:
+        recommendations.append(
+            {
+                "text": (
+                    f"Reduce one-off provider use ({one_time_providers} providers had only one transaction). "
+                    "Consider keeping two or three regular providers to make prices easier to compare."
+                ),
+                "est": 0,
+            }
+        )
+    return conclusions, recommendations
+
+
+# ---------------------------------------------------------------------------
+# Dashboard sections
+# ---------------------------------------------------------------------------
+def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
+    """Render the cross-category overview, spending trends, and key insights.
+
+    Args:
+        data: Cleaned data frames keyed by game or service category.
+        as_of: Latest transaction date across all available categories.
+
+    Returns:
+        None. The overview is rendered directly in the Streamlit interface.
+    """
+    frames = [
+        frame[["Date", "Amount"]].assign(Category=category)
+        for category, frame in data.items()
+    ]
+    all_transactions = pd.concat(frames, ignore_index=True)
+    total_spend = all_transactions["Amount"].sum()
+    current_year = as_of.year
+    year_to_date = all_transactions.loc[
+        all_transactions["Date"].dt.year == current_year, "Amount"
+    ].sum()
+    previous_year_to_date = all_transactions.loc[
+        (all_transactions["Date"].dt.year == current_year - 1)
+        & (all_transactions["Date"] <= as_of - pd.DateOffset(years=1)),
+        "Amount",
+    ].sum()
+    average_last_12 = select_window(all_transactions, as_of, 12)["Amount"].sum() / 12
+    average_previous_12 = select_window(all_transactions, as_of, 24, 12)["Amount"].sum() / 12
+
+    insights = {
+        category: (
+            build_boosting_insights(frame, as_of)
+            if category == BOOSTING_CATEGORY
+            else build_game_insights(frame, as_of)
+        )
+        for category, frame in data.items()
+    }
+    estimated_total_saving = sum(
+        recommendation["est"]
+        for _, recommendations in insights.values()
+        for recommendation in recommendations
+    )
+    recent_overpay = sum(
+        select_window(frame, as_of, 12)["Overpay"].sum()
+        for category, frame in data.items()
+        if category != BOOSTING_CATEGORY
+    )
+    recent_top_up_spend = sum(
+        select_window(frame, as_of, 12)["Amount"].sum()
+        for category, frame in data.items()
+        if category != BOOSTING_CATEGORY
+    )
+    boosting_total = data[BOOSTING_CATEGORY]["Amount"].sum() if BOOSTING_CATEGORY in data else 0
+
+    columns = st.columns(3)
+    date_range = f"{all_transactions['Date'].min():%b %Y} – {all_transactions['Date'].max():%b %Y} · {len(all_transactions)} transactions"
+    render_kpi(columns[0], "Total spend", format_rupiah(total_spend), date_range)
+    if previous_year_to_date > 0:
+        year_change = year_to_date / previous_year_to_date - 1
+        direction = "up" if year_change > 0 else "down" if year_change < 0 else "unchanged"
+        render_kpi(
+            columns[1],
+            f"{current_year} year to date",
+            format_rupiah(year_to_date),
+            f"{direction} {abs(year_change):.0%} vs the comparable period in {current_year - 1} ({format_rupiah(previous_year_to_date)})",
+            "bad" if year_change > 0 else "good",
+        )
+    else:
+        render_kpi(columns[1], f"{current_year} year to date", format_rupiah(year_to_date))
+
+    average_tone = "bad" if average_last_12 > average_previous_12 > 0 else "good"
+    render_kpi(
+        columns[2],
+        "Average monthly spend · 12 months",
+        format_rupiah(average_last_12),
+        f"Previous 12 months: {format_rupiah(average_previous_12)}",
+        average_tone,
+    )
+
+    columns = st.columns(3)
+    overpay_share = recent_overpay / recent_top_up_spend if recent_top_up_spend else 0
+    render_kpi(
+        columns[0],
+        "Top-up overpayment · 12 months",
+        format_rupiah(recent_overpay),
+        f"{overpay_share:.1%} of top-up spend" if recent_top_up_spend else "No top-up transactions",
+        "bad" if recent_overpay > 0 else "good",
+    )
+    boosting_share = boosting_total / total_spend if total_spend else 0
+    render_kpi(
+        columns[1],
+        "Boosting share",
+        f"{boosting_share:.0%}" if total_spend else "—",
+        f"{format_rupiah(boosting_total)} lifetime spend",
+    )
+    render_kpi(
+        columns[2],
+        "Estimated saving potential · 12 months",
+        format_rupiah(estimated_total_saving),
+        "Based on the recommendations below",
+        "good" if estimated_total_saving > 0 else "",
+    )
+
+    st.subheader("Spending trends")
+    left, right = st.columns([3, 1])
+    selected_label = left.radio(
+        "Time period",
+        list(SUMMARY_PERIOD_OPTIONS),
+        horizontal=True,
+        key="overview_period",
+        label_visibility="collapsed",
+    )
+    selected_period = SUMMARY_PERIOD_OPTIONS[selected_label]
+    left.plotly_chart(
+        create_spending_chart(all_transactions, selected_period, "Category", CATEGORY_COLOURS),
+        key="overview_spending_chart",
+        use_container_width=True,
+        theme="streamlit",
+    )
+
+    category_share = all_transactions.groupby("Category")["Amount"].sum().reset_index()
+    donut = px.pie(
+        category_share,
+        names="Category",
+        values="Amount",
+        hole=0.62,
+        color="Category",
+        color_discrete_map=CATEGORY_COLOURS,
+    )
+    donut.update_traces(
+        textinfo="percent",
+        hovertemplate="%{label}: Rp %{value:,.0f}<extra></extra>",
+    )
+    donut.update_layout(
+        height=380,
+        margin={"l": 8, "r": 8, "t": 12, "b": 8},
+        legend={"orientation": "h", "y": -0.1},
+        separators=",.",
+    )
+    right.plotly_chart(donut, key="overview_category_share", use_container_width=True, theme="streamlit")
+
+    st.subheader("Key takeaways and recommendations")
+    category_shares = " · ".join(
+        f"{category}: {frame['Amount'].sum() / total_spend:.0%}"
+        for category, frame in data.items()
+    ) if total_spend else "No category spend recorded"
+    top_lines = [f"Total spend: **{format_rupiah(total_spend)}** ({category_shares})."]
+    if previous_year_to_date > 0:
+        change = year_to_date / previous_year_to_date - 1
+        direction = "increased" if change > 0 else "decreased" if change < 0 else "remained unchanged"
+        top_lines.append(
+            f"Spend in {current_year} to {as_of:%d %b}: **{format_rupiah(year_to_date)}**, "
+            f"{direction} by {abs(change):.0%} against the comparable period in {current_year - 1}."
+        )
+    if recent_top_up_spend:
+        top_lines.append(
+            f"Top-up overpayments in the last 12 months: **{format_rupiah(recent_overpay)}** "
+            f"({overpay_share:.1%} of top-up spend)."
+        )
+    render_bullets(top_lines)
+
+    conclusion_column, recommendation_column = st.columns(2)
+    conclusion_column.markdown("#### Conclusions")
+    recommendation_column.markdown("#### Next cost-saving actions")
+    for category, (conclusions, recommendations) in insights.items():
+        with conclusion_column:
+            st.markdown(f"**{category}**")
+            render_bullets(conclusions[:3])
+        with recommendation_column:
+            st.markdown(f"**{category}**")
+            render_bullets(format_recommendations(recommendations, 3))
+
+    st.caption(
+        "The top-up reference is taken from the worksheet's '70% Value' column. "
+        "Estimated savings are indicative calculations based on transactions from the last 12 months, not guarantees."
+    )
+
+
+def render_game_page(frame: pd.DataFrame, game_name: str, as_of: pd.Timestamp) -> None:
+    """Render detailed metrics, charts, tables, and insights for one game.
+
+    Args:
+        frame: Cleaned transactions for the selected game.
+        game_name: Game label used to create unique Streamlit widget keys.
+        as_of: Date used for rolling 12-month statistics.
+
+    Returns:
+        None. The game analysis page is rendered in the Streamlit interface.
+    """
+    stats = calculate_game_stats(frame, as_of)
+    net = stats["overpay"] - stats["savings"]
+    patch_average = frame.groupby("Version")["Amount"].sum().mean() if not frame.empty else 0
+    overpay_share = stats["overpay"] / stats["total"] if stats["total"] else 0
+    hit_rate = f"{stats['hit_rate']:.0%}" if pd.notna(stats["hit_rate"]) else "—"
+    recent_hit_rate = (
+        f"Last 12 months: {stats['recent_hit_rate']:.0%}"
+        if pd.notna(stats["recent_hit_rate"]) and stats["recent_count"]
+        else "No comparable transactions"
+    )
+
+    columns = st.columns(6)
+    render_kpi(columns[0], "Total spend", format_rupiah(stats["total"]), f"{stats['count']} transactions")
+    render_kpi(columns[1], "Average per patch", format_rupiah(patch_average), f"{frame['Version'].nunique()} patches")
+    render_kpi(columns[2], "Overpayment", format_rupiah(stats["overpay"]), f"{overpay_share:.1%} of spend", "bad")
+    render_kpi(columns[3], "Savings", format_rupiah(stats["savings"]), "Below the reference price", "good")
+    net_label = "Overpayment" if net > 0 else "Savings"
+    render_kpi(
+        columns[4],
+        "Net position",
+        f"{net_label}: {format_rupiah(abs(net))}",
+        "Overpayment less savings",
+        "bad" if net > 0 else "good",
+    )
+    render_kpi(columns[5], "Hit rate · at or below reference", hit_rate, recent_hit_rate)
+
+    st.subheader("Spending trends")
+    selected_label = st.radio(
+        "Time period",
+        list(PERIOD_OPTIONS),
+        horizontal=True,
+        key=f"period_{game_name}",
+        label_visibility="collapsed",
+    )
+    selected_period = PERIOD_OPTIONS[selected_label]
+    left, right = st.columns([3, 2])
+    left.markdown("**Spend by item**")
+    left.plotly_chart(
+        create_spending_chart(frame, selected_period, "Item"),
+        key=f"spending_{game_name}",
+        use_container_width=True,
+        theme="streamlit",
+    )
+    right.markdown("**Overpayment vs savings**")
+    right.plotly_chart(
+        create_balance_chart(frame, selected_period),
+        key=f"balance_{game_name}",
+        use_container_width=True,
+        theme="streamlit",
+    )
+
+    st.subheader("Shops and items")
+    shop_column, item_column = st.columns([2, 3])
+    shop_summary = (
+        frame.groupby("Shop")
+        .agg(
+            Transactions=("Amount", "size"),
+            Overpayment=("Overpay", "sum"),
+            Savings=("Savings", "sum"),
+        )
+        .reset_index()
+    )
+    shop_summary["Net"] = shop_summary["Overpayment"] - shop_summary["Savings"]
+    shop_summary["Status"] = shop_summary["Net"].map(
+        lambda value: "Overpayment" if value > 0 else "Savings"
+    )
+    shop_summary = shop_summary.sort_values("Net")
+    shop_figure = px.bar(
+        shop_summary,
+        x="Net",
+        y="Shop",
+        orientation="h",
+        color="Status",
+        color_discrete_map={"Overpayment": OVERPAY_COLOUR, "Savings": SAVINGS_COLOUR},
+        text=shop_summary["Transactions"].map(lambda value: f"{value}x"),
+    )
+    shop_figure.update_layout(
+        height=max(300, 34 * len(shop_summary) + 80),
+        margin={"l": 8, "r": 8, "t": 12, "b": 8},
+        legend={"orientation": "h", "y": -0.15, "title_text": ""},
+        xaxis_title="Net position (+ overpayment, − savings)",
+        yaxis_title=None,
+        separators=",.",
+    )
+    shop_figure.update_xaxes(tickprefix="Rp ", tickformat=",.0f")
+    shop_column.markdown("**Net position by shop**")
+    shop_column.plotly_chart(
+        shop_figure,
+        key=f"shops_{game_name}",
+        use_container_width=True,
+        theme="streamlit",
+    )
+
+    item_summary = (
+        frame.groupby("Item")
+        .agg(
+            Transactions=("Amount", "size"),
+            Total_spend=("Amount", "sum"),
+            Average_spend=("Amount", "mean"),
+            Reference=("Reference", "last"),
+            Hit_rate=("Overpay", lambda values: (values.eq(0).sum() / values.notna().sum() * 100) if values.notna().any() else float("nan")),
+            Overpayment=("Overpay", "sum"),
+            Savings=("Savings", "sum"),
+        )
+        .reset_index()
+        .sort_values("Total_spend", ascending=False)
+    )
+    item_summary = item_summary.rename(
+        columns={"Total_spend": "Total spend", "Average_spend": "Average spend", "Hit_rate": "Hit rate"}
+    )
+    item_column.markdown("**Item summary**")
+    item_column.dataframe(
+        format_table(item_summary, ["Total spend", "Average spend", "Reference", "Overpayment", "Savings"]),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Hit rate": st.column_config.ProgressColumn("Hit rate", min_value=0, max_value=100, format="%.0f%%")
+        },
+    )
+
+    st.subheader("Promotions and overpayments")
+    promotion_column, overpay_column = st.columns(2)
+    promotions = frame[
+        frame["Reference"].notna() & (frame["Savings"] >= 0.2 * frame["Reference"])
+    ][["Date", "Item", "Shop", "Amount", "Savings"]]
+    promotion_column.markdown("**Promotional purchases · at least 20% below reference**")
+    promotion_column.dataframe(
+        format_table(promotions.sort_values("Date", ascending=False), ["Amount", "Savings"]),
+        hide_index=True,
+        use_container_width=True,
+    )
+    largest_overpayments = frame[frame["Overpay"] > 0].nlargest(10, "Overpay")[
+        ["Date", "Item", "Shop", "Amount", "Overpay"]
+    ]
+    overpay_column.markdown("**10 largest overpayments**")
+    overpay_column.dataframe(
+        format_table(largest_overpayments, ["Amount", "Overpay"]),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    conclusions, recommendations = build_game_insights(frame, as_of)
+    st.subheader("Conclusions and recommendations")
+    conclusion_column, recommendation_column = st.columns(2)
+    conclusion_column.markdown("#### Conclusions")
+    with conclusion_column:
+        render_bullets(conclusions)
+    recommendation_column.markdown("#### Cost-saving actions")
+    with recommendation_column:
+        render_bullets(format_recommendations(recommendations))
+
+    with st.expander("Transaction details"):
+        shop_filter_column, item_filter_column = st.columns(2)
+        selected_shops = shop_filter_column.multiselect(
+            "Shop", sorted(frame["Shop"].dropna().unique()), key=f"shop_filter_{game_name}"
+        )
+        selected_items = item_filter_column.multiselect(
+            "Item", sorted(frame["Item"].dropna().unique()), key=f"item_filter_{game_name}"
+        )
+        mask = pd.Series(True, index=frame.index)
+        if selected_shops:
+            mask &= frame["Shop"].isin(selected_shops)
+        if selected_items:
+            mask &= frame["Item"].isin(selected_items)
+        transactions = frame[mask].drop(columns=["No"], errors="ignore")
+        st.dataframe(
+            format_table(
+                transactions,
+                ["Amount", "Reference", "Variance", "Overpay", "Savings"],
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+def render_boosting_page(frame: pd.DataFrame, as_of: pd.Timestamp) -> None:
+    """Render boosting-service metrics, provider comparisons, and insights.
+
+    Args:
+        frame: Cleaned boosting transactions.
+        as_of: Date used for rolling 12-month statistics.
+
+    Returns:
+        None. The boosting analysis page is rendered in the Streamlit interface.
+    """
+    total_spend = frame["Amount"].sum()
+    transaction_count = len(frame)
+    recent_transactions = select_window(frame, as_of, 12)
+    account_care = frame[
+        (frame["Content"] == "Account care") & frame["Days"].notna() & (frame["Days"] > 0)
+    ].copy()
+    account_care["Daily rate"] = account_care["Amount"] / account_care["Days"]
+    provider_count = frame["Provider"].nunique()
+    one_time_count = int((frame["Provider"].value_counts() == 1).sum())
+    average_spend = total_spend / transaction_count if transaction_count else 0
+
+    columns = st.columns(5)
+    render_kpi(columns[0], "Total boosting spend", format_rupiah(total_spend), f"{transaction_count} transactions")
+    render_kpi(columns[1], "Unique providers", str(provider_count), f"{one_time_count} used once")
+    render_kpi(
+        columns[2],
+        "Average per transaction",
+        format_rupiah(average_spend),
+        f"Median: {format_rupiah(frame['Amount'].median())}",
+    )
+    render_kpi(
+        columns[3],
+        "Last 12 months",
+        format_rupiah(recent_transactions["Amount"].sum()),
+        f"{len(recent_transactions)} transactions",
+    )
+    render_kpi(
+        columns[4],
+        "Account care · median daily rate",
+        format_rupiah(account_care["Daily rate"].median()) if not account_care.empty else "—",
+        f"{len(account_care)} bookings" if not account_care.empty else "No account-care bookings",
+    )
+
+    st.subheader("Spending trends")
+    selected_label = st.radio(
+        "Time period",
+        list(PERIOD_OPTIONS),
+        horizontal=True,
+        key="boosting_period",
+        label_visibility="collapsed",
+    )
+    selected_period = PERIOD_OPTIONS[selected_label]
+    spending_column, provider_column = st.columns([3, 2])
+    spending_column.markdown("**Spend by service type**")
+    spending_column.plotly_chart(
+        create_spending_chart(frame, selected_period, "Content"),
+        key="boosting_spending",
+        use_container_width=True,
+        theme="streamlit",
+    )
+
+    provider_summary = (
+        frame.groupby("Provider")["Amount"]
+        .agg(Total_spend="sum", Transactions="size")
+        .sort_values("Total_spend")
+        .tail(10)
+        .reset_index()
+    )
+    provider_figure = px.bar(
+        provider_summary,
+        x="Total_spend",
+        y="Provider",
+        orientation="h",
+        text=provider_summary["Transactions"].map(lambda value: f"{value}x"),
+        color_discrete_sequence=[ACCENT_COLOUR],
+    )
+    provider_figure.update_layout(
+        height=380,
+        margin={"l": 8, "r": 8, "t": 12, "b": 8},
+        xaxis_title=None,
+        yaxis_title=None,
+        separators=",.",
+    )
+    provider_figure.update_xaxes(tickprefix="Rp ", tickformat=",.0f")
+    provider_column.markdown("**10 highest-spend providers · transaction count at bar end**")
+    provider_column.plotly_chart(
+        provider_figure,
+        key="boosting_top_providers",
+        use_container_width=True,
+        theme="streamlit",
+    )
+
+    st.subheader("Pricing by service type")
+    pricing_column, daily_rate_column = st.columns([3, 2])
+    content_summary = (
+        frame.groupby("Content")["Amount"]
+        .agg(Total_spend="sum", Transactions="size", Median="median", Average="mean", Highest="max")
+        .sort_values("Total_spend", ascending=False)
+        .reset_index()
+    )
+    pricing_column.dataframe(
+        format_table(content_summary, ["Total_spend", "Median", "Average", "Highest"]),
+        hide_index=True,
+        use_container_width=True,
+        column_config={"Average": st.column_config.Column("Average spend")},
+    )
+    if not account_care.empty:
+        daily_rate_figure = px.scatter(
+            account_care,
+            x="Date",
+            y="Daily rate",
+            color="Provider",
+            size="Days",
+            size_max=22,
+            color_discrete_sequence=COLOUR_PALETTE,
+        )
+        daily_rate_figure.update_layout(
+            height=320,
+            margin={"l": 8, "r": 8, "t": 12, "b": 8},
+            xaxis_title=None,
+            yaxis_title=None,
+            legend={"orientation": "h", "y": -0.25, "title_text": ""},
+            separators=",.",
+        )
+        daily_rate_figure.update_yaxes(tickprefix="Rp ", tickformat=",.0f")
+        daily_rate_column.markdown("**Account-care daily rate · bubble size represents days**")
+        daily_rate_column.plotly_chart(
+            daily_rate_figure,
+            key="account_care_daily_rate",
+            use_container_width=True,
+            theme="streamlit",
+        )
+
+    conclusions, recommendations = build_boosting_insights(frame, as_of)
+    st.subheader("Conclusions and recommendations")
+    conclusion_column, recommendation_column = st.columns(2)
+    conclusion_column.markdown("#### Conclusions")
+    with conclusion_column:
+        render_bullets(conclusions)
+    recommendation_column.markdown("#### Cost-saving actions")
+    with recommendation_column:
+        render_bullets(format_recommendations(recommendations))
+
+    with st.expander("Transaction details"):
+        provider_filter_column, content_filter_column = st.columns(2)
+        selected_providers = provider_filter_column.multiselect(
+            "Provider", sorted(frame["Provider"].dropna().unique()), key="boosting_provider_filter"
+        )
+        selected_content = content_filter_column.multiselect(
+            "Service type", sorted(frame["Content"].dropna().unique()), key="boosting_content_filter"
+        )
+        mask = pd.Series(True, index=frame.index)
+        if selected_providers:
+            mask &= frame["Provider"].isin(selected_providers)
+        if selected_content:
+            mask &= frame["Content"].isin(selected_content)
+        transactions = frame[mask].drop(columns=["No"], errors="ignore")
+        st.dataframe(
+            format_table(transactions, ["Amount"]),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Application entry point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    """Configure the Streamlit page, load data, and render dashboard tabs.
+
+    Returns:
+        None. This function runs the complete Streamlit application.
+    """
+    st.set_page_config(
+        page_title="Game Spending Dashboard",
+        page_icon="🎮",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
+
+    st.sidebar.button(
+        "Refresh data",
+        on_click=st.cache_data.clear,
+        help="Clear the cached Google Sheets data and reload the dashboard.",
+        use_container_width=True,
+    )
+
+    try:
+        data = load_sheet_data()
+    except Exception as error:  # Display a useful message while retaining diagnostics.
+        st.error("Unable to load Google Sheets data. Check the sheet ID, service-account secrets, and worksheet access.")
+        with st.expander("Technical details"):
+            st.exception(error)
+        st.stop()
+
+    if not data:
+        st.warning(
+            f"No recognised transaction tables were found in the '{WORKSHEET_NAME}' worksheet. "
+            "Each table must start with 'No' or 'No.' in column A and 'Date' in column B."
+        )
+        st.stop()
+
+    available_dates = [frame["Date"].max() for frame in data.values() if not frame.empty]
+    if not available_dates:
+        st.warning("The recognised tables do not contain any valid dated transactions.")
+        st.stop()
+    as_of = max(available_dates)
+
+    category_list = ", ".join(data)
+    safe_category_list = html.escape(category_list)
+    st.markdown(
+        '<div class="dashboard-header">'
+        '<div class="dashboard-eyebrow">Personal finance · Transaction analysis</div>'
+        '<div class="dashboard-title">Game spending dashboard</div>'
+        f'<div class="dashboard-subtitle">Latest transaction: {as_of:%d %B %Y} · '
+        f'Data available: {safe_category_list}</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    tab_labels = ["Overview", *data.keys()]
+    tabs = st.tabs(tab_labels)
+    with tabs[0]:
+        render_overview(data, as_of)
+
+    for tab, (category, frame) in zip(tabs[1:], data.items()):
+        with tab:
+            if category == BOOSTING_CATEGORY:
+                render_boosting_page(frame, as_of)
+            else:
+                render_game_page(frame, category, as_of)
+
+
+if __name__ == "__main__":
+    main()
