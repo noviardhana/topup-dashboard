@@ -99,7 +99,7 @@ SOURCE_PROVIDER_COLUMN = "Joki"
 
 DASHBOARD_CSS = """
 <style>
-    .block-container { padding-top: 2rem; }
+    .block-container { padding-top: 4.5rem; }
     .dashboard-header {
         padding: 0.2rem 0 1rem 0;
         margin: 0 0 1.25rem 0;
