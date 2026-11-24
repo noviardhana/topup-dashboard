@@ -1669,8 +1669,8 @@ def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
     )
     donut.update_layout(
         height=380,
-        margin={"l": 8, "r": 8, "t": 12, "b": 8},
-        legend={"orientation": "h", "y": -0.1},
+        margin={"l": 8, "r": 8, "t": 12, "b": 40},
+        legend={"orientation": "h", "y": -0.05, "x": 0.5, "xanchor": "center"},
         separators=",.",
     )
     right.plotly_chart(donut, key="overview_category_share", width="stretch", theme="streamlit")
@@ -1701,7 +1701,7 @@ def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
     for category, (conclusions, recommendations) in insights.items():
         with conclusion_column:
             st.markdown(f"**{category}**")
-            render_bullets(conclusions[:3])
+            render_bullets(conclusions[1:4])
         with recommendation_column:
             st.markdown(f"**{category}**")
             render_bullets(format_recommendations(recommendations, 3))
