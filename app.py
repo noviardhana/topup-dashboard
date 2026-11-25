@@ -21,6 +21,8 @@ Configuration
 The application expects ``sheet_id`` and ``gcp_service_account`` to be defined
 in Streamlit secrets. The source worksheet must retain its existing column
 headers, including ``70% Value``, ``Toko``, and ``Keterangan`` where applicable.
+Optionally, define ``app_password`` in Streamlit secrets to require a password
+before any data is loaded; when it is absent the dashboard is not gated.
 
 Run with::
 
@@ -29,6 +31,7 @@ Run with::
 
 from __future__ import annotations
 
+import hmac
 import html
 import numbers
 import re
@@ -79,6 +82,10 @@ SAVINGS_COLOUR = "#009E73"
 OVERPAY_COLOUR = "#D55E00"
 LINE_COLOUR = "#9AA4B2"  # neutral colour for average / cumulative lines
 MATERIAL_ESTIMATE_SHARE = 0.02  # an estimate must reach 2% of 12-month spend to rank High/Medium
+RECOMMENDATIONS_SHOWN = 5  # recommendations shown before the rest move into an expander
+STRONG_EVIDENCE_THRESHOLD = 0.75
+MODERATE_EVIDENCE_THRESHOLD = 0.50
+BUDGET_PERIOD_SCALE = {"Month": 1, "Quarter": 3, "Year": 12}  # months per period
 
 PERIOD_OPTIONS = {
     "Monthly": "Month",
@@ -336,21 +343,61 @@ def render_kpi(column: Any, label: str, value: str, caption: str = "", tone: str
     )
 
 
-def render_bullets(items: list[str]) -> None:
+def evidence_label(score: float) -> str:
+    """Translate a heuristic confidence score into a plain-language label.
+
+    Args:
+        score: Evidence score between 0 and 1.
+
+    Returns:
+        ``strong``, ``moderate``, or ``limited``. A label is used instead of a
+        percentage so the score is not mistaken for a probability.
+    """
+    if score >= STRONG_EVIDENCE_THRESHOLD:
+        return "strong"
+    if score >= MODERATE_EVIDENCE_THRESHOLD:
+        return "moderate"
+    return "limited"
+
+
+def render_bullets(items: list[str], empty_message: str = "Not enough data to show notes yet.") -> None:
     """Render a list of insight statements as Markdown bullets.
 
     Args:
         items: Insight strings to display.
+        empty_message: Message shown in italics when there are no items.
 
     Returns:
         None. The bullet list is rendered in the Streamlit interface.
     """
-    content = "\n".join(f"- {item}" for item in items) if items else "_No notes are available._"
+    content = "\n".join(f"- {item}" for item in items) if items else f"_{empty_message}_"
     st.markdown(content)
 
 
+def empty_recommendation_message(evaluated_transactions: int) -> str:
+    """Explain why no recommendations are shown.
+
+    Args:
+        evaluated_transactions: Number of recent transactions that could be
+            compared with a reference or peer price.
+
+    Returns:
+        A message that separates "nothing could be assessed" from "nothing
+        needs saving".
+    """
+    if evaluated_transactions <= 0:
+        return (
+            "Savings could not be assessed yet: no recent transaction has a usable "
+            "reference price or enough peer data (see Methodology)."
+        )
+    return (
+        f"No savings opportunities detected: {evaluated_transactions} recent transactions "
+        "were compared and all are at or below their benchmark."
+    )
+
+
 def format_recommendations(items: list[dict[str, Any]], limit: int | None = None) -> list[str]:
-    """Format ranked recommendations with their confidence and evidence-based estimate.
+    """Format ranked recommendations with their evidence label and estimate.
 
     Args:
         items: Ranked recommendation dictionaries containing ``text``, ``est``,
@@ -365,12 +412,73 @@ def format_recommendations(items: list[dict[str, Any]], limit: int | None = None
     for item in selected_items:
         priority = str(item.get("priority", "Monitor")).upper()
         confidence = item.get("confidence")
-        confidence_text = f" · {confidence:.0%} confidence" if confidence is not None else ""
-        text = f"**{priority}{confidence_text}** — {item['text']}"
+        evidence_text = f" · {evidence_label(confidence)} evidence" if confidence is not None else ""
+        text = f"**{priority}{evidence_text}** — {item['text']}"
         if item.get("est", 0) > 0:
             text += f" _(estimated avoidable spend: {format_rupiah(item['est'])})_"
         output.append(text)
     return output
+
+
+def render_recommendations(
+    recommendations: list[dict[str, Any]],
+    evaluated_transactions: int,
+    limit: int = RECOMMENDATIONS_SHOWN,
+    expand_rest: bool = True,
+) -> None:
+    """Render the top recommendations, optionally folding the rest into an expander.
+
+    Args:
+        recommendations: Ranked recommendation dictionaries.
+        evaluated_transactions: Number of transactions that could be compared;
+            used to word the empty-state message.
+        limit: Number of recommendations shown directly.
+        expand_rest: When True, remaining items go into a "View all" expander;
+            when False they are omitted (used by the compact overview).
+
+    Returns:
+        None. The recommendations are rendered in the Streamlit interface.
+    """
+    if not recommendations:
+        render_bullets([], empty_recommendation_message(evaluated_transactions))
+        return
+    formatted = format_recommendations(recommendations)
+    render_bullets(formatted[:limit])
+    if expand_rest and len(formatted) > limit:
+        with st.expander(f"View remaining {len(formatted) - limit} recommendations"):
+            render_bullets(formatted[limit:])
+
+
+def render_methodology() -> None:
+    """Render a popover that explains how targets, estimates, and labels work.
+
+    Returns:
+        None. The popover is rendered in the Streamlit interface.
+    """
+    with st.popover("Methodology"):
+        st.markdown(
+            f"""
+**Targets.** Game purchases are compared with the lower of the worksheet's `{SOURCE_REFERENCE_COLUMN}`
+and the median of eligible alternative shops. Boosting services are compared with the median of
+eligible alternative providers (account care by daily rate). Each recommendation shows its basis:
+`{SOURCE_REFERENCE_COLUMN}` or `Peer median`.
+
+**Eligibility.** Benchmarks use up to {BENCHMARK_LOOKBACK_MONTHS} months of history. A peer comparison needs
+at least {MINIMUM_PEER_ENTITIES} alternative shops or providers with at least
+{MINIMUM_ENTITY_TRANSACTIONS} transactions each.
+
+**Estimates.** Avoidable spend is the amount paid above the target in the last
+{RECOMMENDATION_LOOKBACK_MONTHS} months. It is a historical comparison, not guaranteed future savings.
+The confidence-weighted figure multiplies each estimate by its evidence score.
+
+**Evidence.** `strong` is a score of {STRONG_EVIDENCE_THRESHOLD:.2f} or higher, `moderate` is
+{MODERATE_EVIDENCE_THRESHOLD:.2f} or higher, and `limited` is below that. The score is a heuristic based on
+sample size, number of peers, and price dispersion; it is not a probability.
+
+**Priority.** High, Medium, and Monitor are relative within each tab. Estimates below
+{MATERIAL_ESTIMATE_SHARE:.0%} of 12-month spend are always Monitor.
+"""
+        )
 
 
 def format_table(frame: pd.DataFrame, money_columns: tuple[str, ...] | list[str] = ()) -> pd.DataFrame:
@@ -390,6 +498,34 @@ def format_table(frame: pd.DataFrame, money_columns: tuple[str, ...] | list[str]
         if column in display:
             display[column] = display[column].map(format_rupiah)
     return display
+
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+def check_password() -> bool:
+    """Require a password when ``app_password`` is defined in Streamlit secrets.
+
+    Returns:
+        True when no password is configured or the correct password was entered
+        in this session; False otherwise (a password prompt is rendered).
+    """
+    try:
+        expected = st.secrets.get("app_password")
+    except (FileNotFoundError, KeyError):
+        expected = None
+    if not expected:
+        return True
+    if st.session_state.get("authenticated"):
+        return True
+
+    entered = st.text_input("Password", type="password", key="password_input")
+    if entered:
+        if hmac.compare_digest(entered.encode("utf-8"), str(expected).encode("utf-8")):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        st.error("Incorrect password.")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +734,7 @@ def create_spending_chart(
     period: str,
     group_column: str,
     colour_map: dict[str, str] | None = None,
+    monthly_budget: float | None = None,
 ) -> go.Figure:
     """Create a stacked spending chart with a three-month average when relevant.
 
@@ -607,6 +744,8 @@ def create_spending_chart(
         period: Period identifier: ``Month``, ``Quarter``, ``Year``, or ``Patch``.
         group_column: Column used to split spending into categories.
         colour_map: Optional mapping of group labels to colours.
+        monthly_budget: Optional monthly budget in rupiah. When positive, a
+            dashed budget line is drawn, scaled to the selected period.
 
     Returns:
         A styled Plotly bar chart.
@@ -659,6 +798,18 @@ def create_spending_chart(
             name="Three-month average",
             line={"color": LINE_COLOUR, "width": 2, "dash": "dot"},
             hovertemplate="Three-month average: Rp %{y:,.0f}<extra></extra>",
+        )
+    budget_scale = BUDGET_PERIOD_SCALE.get(period)
+    if monthly_budget and monthly_budget > 0 and budget_scale and not pivot.empty:
+        # A trace (not add_hline) keeps the line inside the autoscaled y-range.
+        budget_value = monthly_budget * budget_scale
+        figure.add_scatter(
+            x=total_by_period.index,
+            y=[budget_value] * len(total_by_period),
+            mode="lines",
+            name="Budget",
+            line={"color": OVERPAY_COLOUR, "width": 2, "dash": "dash"},
+            hovertemplate="Budget: Rp %{y:,.0f}<extra></extra>",
         )
     return style_figure(figure, period, order)
 
@@ -843,7 +994,8 @@ def calculate_benchmarks(
 
     Returns:
         A data frame with each group/entity median and its eligible peer median,
-        peer counts, latest transaction date, and peer-price dispersion.
+        peer counts, latest transaction date, peer-price dispersion, and the
+        cheapest eligible peer with its median price.
     """
     result_columns = [
         group_column,
@@ -854,6 +1006,8 @@ def calculate_benchmarks(
         "peer_entities",
         "peer_transactions",
         "peer_dispersion",
+        "cheapest_peer",
+        "cheapest_peer_median",
         "last_transaction",
     ]
     required = {"Date", group_column, entity_column, price_column}
@@ -887,6 +1041,8 @@ def calculate_benchmarks(
 
         peer_median = float("nan")
         peer_dispersion = float("nan")
+        cheapest_peer = None
+        cheapest_peer_median = float("nan")
         if peer_entity_count >= minimum_peer_entities:
             # Give each eligible shop/provider equal weight, regardless of purchase frequency.
             peer_median = float(peer_entity_medians.median())
@@ -896,6 +1052,9 @@ def calculate_benchmarks(
             peer_dispersion = (
                 median_absolute_deviation / abs(peer_median) if peer_median else 0.0
             )
+            # Cheapest eligible alternative, named in recommendations.
+            cheapest_peer = peer_entity_medians.idxmin()
+            cheapest_peer_median = float(peer_entity_medians.min())
 
         records.append(
             {
@@ -907,6 +1066,8 @@ def calculate_benchmarks(
                 "peer_entities": peer_entity_count,
                 "peer_transactions": int(len(eligible_peer_frame)),
                 "peer_dispersion": peer_dispersion,
+                "cheapest_peer": cheapest_peer,
+                "cheapest_peer_median": cheapest_peer_median,
                 "last_transaction": entity_frame["Date"].max(),
             }
         )
@@ -979,7 +1140,8 @@ def calculate_savings(
 
     Returns:
         Aggregated opportunities by group and entity, including estimated
-        avoidable spend, evidence counts, confidence inputs, and latest date.
+        avoidable spend, evidence counts, confidence inputs, the basis of the
+        target price, the cheapest eligible peer, and the latest date.
     """
     output_columns = [
         group_column,
@@ -992,6 +1154,9 @@ def calculate_savings(
         "peer_entities",
         "peer_transactions",
         "peer_dispersion",
+        "target_basis",
+        "cheapest_peer",
+        "cheapest_peer_median",
         "last_transaction",
     ]
     if frame.empty:
@@ -1008,12 +1173,16 @@ def calculate_savings(
         "peer_entities",
         "peer_transactions",
         "peer_dispersion",
+        "cheapest_peer",
+        "cheapest_peer_median",
     ]
     if benchmarks.empty:
         recent["peer_median"] = float("nan")
         recent["peer_entities"] = 0
         recent["peer_transactions"] = 0
         recent["peer_dispersion"] = float("nan")
+        recent["cheapest_peer"] = None
+        recent["cheapest_peer_median"] = float("nan")
     else:
         recent = recent.merge(
             benchmarks[benchmark_columns],
@@ -1030,8 +1199,16 @@ def calculate_savings(
             [recent["peer_median"], reference_prices.rename("reference_price")], axis=1
         )
         recent["target_price"] = target_frame.min(axis=1, skipna=True)
+        # The reference wins ties and whenever no peer median exists.
+        uses_reference = reference_prices.notna() & (
+            reference_prices <= recent["peer_median"].fillna(float("inf"))
+        )
+        recent["target_basis"] = uses_reference.map(
+            {True: SOURCE_REFERENCE_COLUMN, False: "Peer median"}
+        )
     else:
         recent["target_price"] = recent["peer_median"]
+        recent["target_basis"] = "Peer median"
 
     if multiplier_column and multiplier_column in recent:
         multiplier = pd.to_numeric(recent[multiplier_column], errors="coerce")
@@ -1065,6 +1242,15 @@ def calculate_savings(
                 "peer_transactions": int(group_frame["peer_transactions"].fillna(0).max()),
                 "peer_dispersion": float(group_frame["peer_dispersion"].dropna().median())
                 if group_frame["peer_dispersion"].notna().any()
+                else float("nan"),
+                "target_basis": str(group_frame["target_basis"].mode().iloc[0]),
+                "cheapest_peer": (
+                    group_frame["cheapest_peer"].dropna().iloc[0]
+                    if group_frame["cheapest_peer"].notna().any()
+                    else None
+                ),
+                "cheapest_peer_median": float(group_frame["cheapest_peer_median"].dropna().iloc[0])
+                if group_frame["cheapest_peer_median"].notna().any()
                 else float("nan"),
                 "last_transaction": group_frame["Date"].max(),
             }
@@ -1145,11 +1331,39 @@ def rank_recommendations(
     return ranked
 
 
+def _alternative_text(opportunity: pd.Series, unit_label: str = "") -> str:
+    """Name the cheapest eligible alternative when it beats the observed price.
+
+    Args:
+        opportunity: One row from :func:`calculate_savings`.
+        unit_label: Optional unit appended to the price, such as `` per day``.
+
+    Returns:
+        A sentence naming the alternative and its median, or an empty string
+        when no cheaper eligible alternative exists.
+    """
+    peer = opportunity.get("cheapest_peer")
+    peer_median = opportunity.get("cheapest_peer_median")
+    observed = opportunity.get("observed_median")
+    if peer is None or pd.isna(peer) or pd.isna(peer_median) or pd.isna(observed):
+        return ""
+    if peer_median >= observed:
+        return ""
+    return f" Alternative: **{peer}** (median {format_rupiah(peer_median)}{unit_label})."
+
+
+def _evaluated_total(opportunities: pd.DataFrame) -> int:
+    """Return the number of transactions that were compared with a target."""
+    if opportunities.empty:
+        return 0
+    return int(pd.to_numeric(opportunities["evaluated_transactions"], errors="coerce").fillna(0).sum())
+
+
 def generate_candidates(
     frame: pd.DataFrame,
     as_of: pd.Timestamp,
     category: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     """Generate comparable-price opportunities for game or boosting spend.
 
     Game purchases are assessed against the lower of the source reference price
@@ -1163,13 +1377,15 @@ def generate_candidates(
         category: Game name or the ``Boosting`` category label.
 
     Returns:
-        Ranked recommendation dictionaries with estimated avoidable spend,
-        confidence, recency, priority score, and supporting evidence.
+        A tuple of ranked recommendation dictionaries (with estimated avoidable
+        spend, confidence, recency, priority score, and supporting evidence) and
+        the number of recent transactions that could be compared with a target.
     """
     candidates: list[dict[str, Any]] = []
+    evaluated = 0
 
     if frame.empty:
-        return candidates
+        return candidates, evaluated
 
     if category != BOOSTING_CATEGORY:
         benchmarks = calculate_benchmarks(
@@ -1187,6 +1403,7 @@ def generate_candidates(
             as_of,
             reference_column="Reference" if "Reference" in frame else None,
         )
+        evaluated += _evaluated_total(opportunities)
         for _, opportunity in opportunities.iterrows():
             estimate = float(opportunity["estimated_avoidable_spend"])
             if estimate <= 0:
@@ -1202,12 +1419,12 @@ def generate_candidates(
             candidates.append(
                 {
                     "text": (
-                        f"Set a price ceiling of **{format_rupiah(opportunity['target_price'])}** for "
-                        f"**{item_name}** at **{shop_name}**. "
+                        f"Set a price ceiling of **{format_rupiah(opportunity['target_price'])}** "
+                        f"(`{opportunity['target_basis']}`) for **{item_name}** at **{shop_name}**. "
                         f"{int(opportunity['affected_transactions'])} of "
                         f"{int(opportunity['evaluated_transactions'])} comparable purchases in the last "
-                        "12 months were above this target. The target uses the lower of the 70% reference "
-                        "and the median from eligible alternative shops, where both are available."
+                        "12 months were above this target."
+                        f"{_alternative_text(opportunity)}"
                     ),
                     "est": estimate,
                     "confidence": confidence,
@@ -1216,6 +1433,7 @@ def generate_candidates(
                         "group": item_name,
                         "entity": shop_name,
                         "target_price": float(opportunity["target_price"]),
+                        "target_basis": str(opportunity["target_basis"]),
                         "evaluated_transactions": int(opportunity["evaluated_transactions"]),
                     },
                 }
@@ -1278,6 +1496,7 @@ def generate_candidates(
                 as_of,
                 multiplier_column="Days",
             )
+            evaluated += _evaluated_total(daily_opportunities)
             for _, opportunity in daily_opportunities.iterrows():
                 estimate = float(opportunity["estimated_avoidable_spend"])
                 if estimate <= 0:
@@ -1293,9 +1512,11 @@ def generate_candidates(
                     {
                         "text": (
                             f"For **Account care** bookings with **{provider_name}**, compare the daily rate "
-                            f"with the eligible peer-provider median of **{format_rupiah(opportunity['target_price'])}**. "
+                            f"with the eligible peer-provider median of **{format_rupiah(opportunity['target_price'])}** "
+                            f"(`{opportunity['target_basis']}`). "
                             f"{int(opportunity['affected_transactions'])} of "
                             f"{int(opportunity['evaluated_transactions'])} recent bookings were above that rate."
+                            f"{_alternative_text(opportunity, ' per day')}"
                         ),
                         "est": estimate,
                         "confidence": confidence,
@@ -1323,6 +1544,7 @@ def generate_candidates(
                 "Amount",
                 as_of,
             )
+            evaluated += _evaluated_total(recurring_opportunities)
             for _, opportunity in recurring_opportunities.iterrows():
                 estimate = float(opportunity["estimated_avoidable_spend"])
                 if estimate <= 0:
@@ -1339,9 +1561,11 @@ def generate_candidates(
                     {
                         "text": (
                             f"Review **{service_name}** pricing with **{provider_name}**. The peer-provider "
-                            f"median is **{format_rupiah(opportunity['target_price'])}** per transaction; "
+                            f"median is **{format_rupiah(opportunity['target_price'])}** "
+                            f"(`{opportunity['target_basis']}`) per transaction; "
                             f"{int(opportunity['affected_transactions'])} of "
                             f"{int(opportunity['evaluated_transactions'])} recent bookings were above it."
+                            f"{_alternative_text(opportunity, ' per booking')}"
                         ),
                         "est": estimate,
                         "confidence": confidence,
@@ -1365,23 +1589,73 @@ def generate_candidates(
             )
 
     recent_spend = select_window(frame, as_of, 12)["Amount"].sum()
-    return rank_recommendations(
+    ranked = rank_recommendations(
         score_recommendations(candidates, as_of),
         minimum_estimate=MATERIAL_ESTIMATE_SHARE * recent_spend,
     )
+    return ranked, evaluated
 
 
-def build_game_insights(frame: pd.DataFrame, as_of: pd.Timestamp) -> tuple[list[str], list[dict[str, Any]]]:
-    """Generate game-spending conclusions and ranked saving opportunities.
+def build_overpay_trend_summary(frame: pd.DataFrame, as_of: pd.Timestamp) -> str | None:
+    """Compare the overpayment rate of the last 12 months with the 12 before.
 
     Args:
-        frame: Cleaned game transaction data.
+        frame: Game transactions containing ``Amount`` and ``Overpay``.
+        as_of: Date used as the end of the comparison windows.
+
+    Returns:
+        A Markdown-ready sentence, or None when either window has too few
+        transactions or no spend. The rate (overpay / spend) is used so the
+        comparison stays fair when the earlier window is only partly covered.
+    """
+    recent = select_window(frame, as_of, 12)
+    previous = select_window(frame, as_of, 24, 12)
+    if len(recent) < MINIMUM_ENTITY_TRANSACTIONS or len(previous) < MINIMUM_ENTITY_TRANSACTIONS:
+        return None
+    recent_spend = recent["Amount"].sum()
+    previous_spend = previous["Amount"].sum()
+    if recent_spend <= 0 or previous_spend <= 0:
+        return None
+
+    recent_overpay = recent["Overpay"].sum()
+    previous_overpay = previous["Overpay"].sum()
+    recent_share = recent_overpay / recent_spend
+    previous_share = previous_overpay / previous_spend
+    difference = recent_share - previous_share
+    if abs(difference) < 0.005:
+        relation, verdict = "level with", "stable"
+    elif difference < 0:
+        relation, verdict = "down from", "improving"
+    else:
+        relation, verdict = "up from", "getting worse"
+    return (
+        f"Overpayment rate over the last 12 months was **{recent_share:.1%}** of spend, {relation} "
+        f"{previous_share:.1%} in the preceding 12 months "
+        f"({format_rupiah(recent_overpay)} vs {format_rupiah(previous_overpay)}); "
+        f"purchasing habits are {verdict}."
+    )
+
+
+def build_game_insights(
+    frame: pd.DataFrame,
+    as_of: pd.Timestamp,
+) -> tuple[list[str], list[dict[str, Any]], int]:
+    """Generate game-spending conclusions and ranked saving opportunities.
+
+    Conclusions are ordered from the most to the least informative on the
+    overview: total, net position, spending trend, largest recent overpayment,
+    inactive shops with overpayment history, overpayment-rate trend, and hit
+    rate last (it is already shown on the KPI cards).
+
+    Args:
+        frame: Cleaned game transactions.
         as_of: Date used for rolling 12-month comparisons.
 
     Returns:
-        Conclusions and ranked recommendation dictionaries. Estimates describe
-        avoidable spend in comparable historical transactions, not guaranteed
-        future savings.
+        Conclusions, ranked recommendation dictionaries, and the number of
+        transactions that could be compared with a target. Recommendations
+        estimate avoidable spend in comparable historical transactions, not
+        guaranteed future savings.
     """
     conclusions: list[str] = []
     stats = calculate_game_stats(frame, as_of)
@@ -1403,20 +1677,6 @@ def build_game_insights(frame: pd.DataFrame, as_of: pd.Timestamp) -> tuple[list[
             f"The net position is **{format_rupiah(-net)} in savings**; savings "
             f"({format_rupiah(stats['savings'])}) exceed overpayments."
         )
-
-    if pd.notna(stats["hit_rate"]):
-        hit_rate_text = f"{stats['hit_rate']:.0%} of transactions with a reference price were at or below that price."
-    else:
-        hit_rate_text = "A hit rate is unavailable because reference prices are missing."
-    if stats["recent_count"]:
-        if pd.notna(stats["recent_hit_rate"]):
-            hit_rate_text += (
-                f" Over the last 12 months: {stats['recent_hit_rate']:.0%} "
-                f"across {stats['recent_count']} transactions."
-            )
-        else:
-            hit_rate_text += f" There were {stats['recent_count']} transactions in the last 12 months."
-    conclusions.append(hit_rate_text)
 
     trend = build_trend_summary(frame, as_of)
     if trend:
@@ -1448,14 +1708,32 @@ def build_game_insights(frame: pd.DataFrame, as_of: pd.Timestamp) -> tuple[list[
                 f"{shop_names}. Review their prices before using them again."
             )
 
-    recommendations = generate_candidates(frame, as_of, category="game")
-    return conclusions, recommendations
+    overpay_trend = build_overpay_trend_summary(frame, as_of)
+    if overpay_trend:
+        conclusions.append(overpay_trend)
+
+    if pd.notna(stats["hit_rate"]):
+        hit_rate_text = f"{stats['hit_rate']:.0%} of transactions with a reference price were at or below that price."
+    else:
+        hit_rate_text = "A hit rate is unavailable because reference prices are missing."
+    if stats["recent_count"]:
+        if pd.notna(stats["recent_hit_rate"]):
+            hit_rate_text += (
+                f" Over the last 12 months: {stats['recent_hit_rate']:.0%} "
+                f"across {stats['recent_count']} transactions."
+            )
+        else:
+            hit_rate_text += f" There were {stats['recent_count']} transactions in the last 12 months."
+    conclusions.append(hit_rate_text)
+
+    recommendations, evaluated = generate_candidates(frame, as_of, category="game")
+    return conclusions, recommendations, evaluated
 
 
 def build_boosting_insights(
     frame: pd.DataFrame,
     as_of: pd.Timestamp,
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> tuple[list[str], list[dict[str, Any]], int]:
     """Generate boosting conclusions and ranked provider-price opportunities.
 
     Args:
@@ -1463,7 +1741,8 @@ def build_boosting_insights(
         as_of: Date used for rolling 12-month comparisons.
 
     Returns:
-        Conclusions and ranked recommendation dictionaries. Account-care rates
+        Conclusions, ranked recommendation dictionaries, and the number of
+        transactions that could be compared with a target. Account-care rates
         are compared per day; other recurring services are compared per booking.
     """
     conclusions: list[str] = []
@@ -1517,19 +1796,24 @@ def build_boosting_insights(
             "from at least two alternative providers."
         )
 
-    recommendations = generate_candidates(frame, as_of, category=BOOSTING_CATEGORY)
-    return conclusions, recommendations
+    recommendations, evaluated = generate_candidates(frame, as_of, category=BOOSTING_CATEGORY)
+    return conclusions, recommendations, evaluated
 
 
 # ---------------------------------------------------------------------------
 # Dashboard sections
 # ---------------------------------------------------------------------------
-def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
+def render_overview(
+    data: dict[str, pd.DataFrame],
+    as_of: pd.Timestamp,
+    monthly_budget: float = 0.0,
+) -> None:
     """Render the cross-category overview, spending trends, and key insights.
 
     Args:
         data: Cleaned data frames keyed by game or service category.
         as_of: Latest transaction date across all available categories.
+        monthly_budget: Optional monthly budget in rupiah; 0 hides the budget line.
 
     Returns:
         None. The overview is rendered directly in the Streamlit interface.
@@ -1570,9 +1854,15 @@ def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
     }
     estimated_total_saving = sum(
         recommendation["est"]
-        for _, recommendations in insights.values()
+        for _, recommendations, _ in insights.values()
         for recommendation in recommendations
     )
+    weighted_total_saving = sum(
+        recommendation["est"] * recommendation.get("confidence", 0.0)
+        for _, recommendations, _ in insights.values()
+        for recommendation in recommendations
+    )
+    total_evaluated = sum(evaluated for _, _, evaluated in insights.values())
     recent_overpay = sum(
         select_window(frame, as_of, 12)["Overpay"].sum()
         for category, frame in data.items()
@@ -1633,7 +1923,7 @@ def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
         columns[2],
         "Estimated avoidable spend · 12 months",
         format_rupiah(estimated_total_saving),
-        "Historical comparison against eligible price benchmarks",
+        f"Confidence-weighted: {format_rupiah(weighted_total_saving)}",
         "good" if estimated_total_saving > 0 else "",
     )
 
@@ -1648,7 +1938,13 @@ def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
     )
     selected_period = SUMMARY_PERIOD_OPTIONS[selected_label]
     left.plotly_chart(
-        create_spending_chart(all_transactions, selected_period, "Category", CATEGORY_COLOURS),
+        create_spending_chart(
+            all_transactions,
+            selected_period,
+            "Category",
+            CATEGORY_COLOURS,
+            monthly_budget=monthly_budget,
+        ),
         key="overview_spending_chart",
         width="stretch",
         theme="streamlit",
@@ -1676,39 +1972,39 @@ def render_overview(data: dict[str, pd.DataFrame], as_of: pd.Timestamp) -> None:
     right.plotly_chart(donut, key="overview_category_share", width="stretch", theme="streamlit")
 
     st.subheader("Key takeaways and recommendations")
-    category_shares = " · ".join(
-        f"{category}: {frame['Amount'].sum() / total_spend:.0%}"
-        for category, frame in data.items()
-    ) if total_spend else "No category spend recorded"
-    top_lines = [f"Total spend: **{format_rupiah(total_spend)}** ({category_shares})."]
-    if previous_year_to_date > 0:
-        change = year_to_date / previous_year_to_date - 1
-        direction = "increased" if change > 0 else "decreased" if change < 0 else "remained unchanged"
-        top_lines.append(
-            f"Spend in {current_year} to {as_of:%d %b}: **{format_rupiah(year_to_date)}**, "
-            f"{direction} by {abs(change):.0%} against the comparable period in {current_year - 1}."
+    if total_evaluated <= 0:
+        headline = "Avoidable spend could not be assessed yet: no recent transaction has a usable benchmark."
+    elif estimated_total_saving > 0:
+        saving_by_category = {
+            category: sum(recommendation["est"] for recommendation in recommendations)
+            for category, (_, recommendations, _) in insights.items()
+        }
+        top_category = max(saving_by_category, key=saving_by_category.get)
+        top_share = saving_by_category[top_category] / estimated_total_saving
+        headline = (
+            f"**{top_category}** accounts for {top_share:.0%} of the estimated avoidable spend "
+            f"({format_rupiah(saving_by_category[top_category])} of {format_rupiah(estimated_total_saving)})."
         )
-    if recent_top_up_spend:
-        top_lines.append(
-            f"Top-up overpayments in the last 12 months: **{format_rupiah(recent_overpay)}** "
-            f"({overpay_share:.1%} of top-up spend)."
-        )
-    render_bullets(top_lines)
+    else:
+        headline = "No avoidable spend detected: recent prices are at or below their benchmarks."
+    st.markdown(headline)
+    render_methodology()
 
     conclusion_column, recommendation_column = st.columns(2)
     conclusion_column.markdown("#### Conclusions")
     recommendation_column.markdown("#### Next cost-saving actions")
-    for category, (conclusions, recommendations) in insights.items():
+    for category, (conclusions, recommendations, evaluated) in insights.items():
         with conclusion_column:
             st.markdown(f"**{category}**")
             render_bullets(conclusions[1:4])
         with recommendation_column:
             st.markdown(f"**{category}**")
-            render_bullets(format_recommendations(recommendations, 3))
+            render_recommendations(recommendations, evaluated, limit=3, expand_rest=False)
 
     st.caption(
         "The top-up reference is taken from the worksheet's '70% Value' column. "
-        "Avoidable-spend estimates compare transactions from the last 12 months with eligible reference or peer prices. They are historical estimates, not guaranteed future savings. Peer comparisons require at least two transactions per entity and two eligible peer entities. Confidence is a heuristic evidence score, not a statistical probability."
+        "Estimates are historical comparisons, not guaranteed future savings; "
+        "open Methodology for how targets and evidence labels are determined."
     )
 
 
@@ -1866,15 +2162,16 @@ def render_game_page(frame: pd.DataFrame, game_name: str, as_of: pd.Timestamp) -
         width="stretch",
     )
 
-    conclusions, recommendations = build_game_insights(frame, as_of)
+    conclusions, recommendations, evaluated = build_game_insights(frame, as_of)
     st.subheader("Conclusions and recommendations")
+    render_methodology()
     conclusion_column, recommendation_column = st.columns(2)
     conclusion_column.markdown("#### Conclusions")
     with conclusion_column:
         render_bullets(conclusions)
     recommendation_column.markdown("#### Cost-saving actions")
     with recommendation_column:
-        render_bullets(format_recommendations(recommendations))
+        render_recommendations(recommendations, evaluated)
 
     with st.expander("Transaction details"):
         shop_filter_column, item_filter_column = st.columns(2)
@@ -1897,6 +2194,13 @@ def render_game_page(frame: pd.DataFrame, game_name: str, as_of: pd.Timestamp) -
             ),
             hide_index=True,
             width="stretch",
+        )
+        st.download_button(
+            "Download CSV",
+            data=transactions.to_csv(index=False).encode("utf-8"),
+            file_name=f"{game_name.lower()}_transactions.csv",
+            mime="text/csv",
+            key=f"download_{game_name}",
         )
 
 
@@ -2033,15 +2337,16 @@ def render_boosting_page(frame: pd.DataFrame, as_of: pd.Timestamp) -> None:
             theme="streamlit",
         )
 
-    conclusions, recommendations = build_boosting_insights(frame, as_of)
+    conclusions, recommendations, evaluated = build_boosting_insights(frame, as_of)
     st.subheader("Conclusions and recommendations")
+    render_methodology()
     conclusion_column, recommendation_column = st.columns(2)
     conclusion_column.markdown("#### Conclusions")
     with conclusion_column:
         render_bullets(conclusions)
     recommendation_column.markdown("#### Cost-saving actions")
     with recommendation_column:
-        render_bullets(format_recommendations(recommendations))
+        render_recommendations(recommendations, evaluated)
 
     with st.expander("Transaction details"):
         provider_filter_column, content_filter_column = st.columns(2)
@@ -2062,6 +2367,13 @@ def render_boosting_page(frame: pd.DataFrame, as_of: pd.Timestamp) -> None:
             hide_index=True,
             width="stretch",
         )
+        st.download_button(
+            "Download CSV",
+            data=transactions.to_csv(index=False).encode("utf-8"),
+            file_name="boosting_transactions.csv",
+            mime="text/csv",
+            key="download_boosting",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2080,6 +2392,9 @@ def main() -> None:
     )
     st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
 
+    if not check_password():
+        st.stop()
+
     st.sidebar.button(
         "Refresh data",
         on_click=st.cache_data.clear,
@@ -2088,25 +2403,59 @@ def main() -> None:
     )
 
     try:
-        data = load_sheet_data()
+        all_data = load_sheet_data()
     except Exception as error:  # Display a useful message while retaining diagnostics.
         st.error("Unable to load Google Sheets data. Check the sheet ID, service-account secrets, and worksheet access.")
         with st.expander("Technical details"):
             st.exception(error)
         st.stop()
 
-    if not data:
+    if not all_data:
         st.warning(
             f"No recognised transaction tables were found in the '{WORKSHEET_NAME}' worksheet. "
             "Each table must start with 'No' or 'No.' in column A and 'Date' in column B."
         )
         st.stop()
 
-    available_dates = [frame["Date"].max() for frame in data.values() if not frame.empty]
+    available_dates = [frame["Date"] for frame in all_data.values() if not frame.empty]
     if not available_dates:
         st.warning("The recognised tables do not contain any valid dated transactions.")
         st.stop()
-    as_of = max(available_dates)
+    earliest = min(dates.min() for dates in available_dates).date()
+    latest = max(dates.max() for dates in available_dates).date()
+
+    selected_range = st.sidebar.date_input(
+        "Date range",
+        value=(earliest, latest),
+        min_value=earliest,
+        max_value=latest,
+        key="date_range",
+        help="Applies to every tab. Rolling 12-month figures are measured back from the end date.",
+    )
+    if not isinstance(selected_range, (tuple, list)) or len(selected_range) != 2:
+        st.info("Select both a start date and an end date in the sidebar.")
+        st.stop()
+    range_start = pd.Timestamp(selected_range[0])
+    range_end = pd.Timestamp(selected_range[1]) + pd.Timedelta(days=1)
+
+    monthly_budget = st.sidebar.number_input(
+        "Monthly budget (Rp)",
+        min_value=0,
+        value=0,
+        step=50_000,
+        key="monthly_budget",
+        help="Draws a budget line on the overview spending chart. Set to 0 to hide it.",
+    )
+
+    data = {
+        category: frame[(frame["Date"] >= range_start) & (frame["Date"] < range_end)].reset_index(drop=True)
+        for category, frame in all_data.items()
+    }
+    data = {category: frame for category, frame in data.items() if not frame.empty}
+    if not data:
+        st.warning("No transactions fall within the selected date range.")
+        st.stop()
+    as_of = max(frame["Date"].max() for frame in data.values())
 
     category_list = ", ".join(data)
     safe_category_list = html.escape(category_list)
@@ -2123,7 +2472,7 @@ def main() -> None:
     tab_labels = ["Overview", *data.keys()]
     tabs = st.tabs(tab_labels)
     with tabs[0]:
-        render_overview(data, as_of)
+        render_overview(data, as_of, float(monthly_budget))
 
     for tab, (category, frame) in zip(tabs[1:], data.items()):
         with tab:
