@@ -39,7 +39,9 @@ import streamlit as st
 from game_dashboard.auth import check_password
 from game_dashboard.config import BOOSTING_CATEGORY, DASHBOARD_CSS, WORKSHEET_NAME
 from game_dashboard.data import load_sheet_data
-from game_dashboard.pages import render_boosting_page, render_game_page, render_overview
+from game_dashboard.page_boosting import render_boosting_page
+from game_dashboard.page_game import render_game_page
+from game_dashboard.page_overview import render_overview
 
 
 def main() -> None:
