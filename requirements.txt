@@ -1,4 +1,6 @@
-streamlit
-pandas
-plotly
-gspread
+# Versions below are the ones the dashboard was tested with.
+# Lower bounds are the tested versions; upper bounds avoid the next major release.
+streamlit>=1.67,<2
+gspread>=6.2,<7
+pandas>=3.0,<4
+plotly>=7.1,<8
